@@ -1,0 +1,1 @@
+﻿# SIGIL Asset Compiler

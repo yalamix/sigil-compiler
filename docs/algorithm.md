@@ -1,0 +1,1 @@
+﻿# SIGIL Algorithm Specification

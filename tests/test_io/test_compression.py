@@ -1,0 +1,1 @@
+﻿# Test LZMA round-trip
