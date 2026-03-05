@@ -1,4 +1,8 @@
-﻿# SIGIL Asset Compiler
+﻿<p align="center">
+  <img src="assets/logo.png" alt="Project Logo" width="200">
+</p>
+
+# SIGIL Asset Compiler
 
 SIGIL compiles 3D meshes, textures, and sounds into compact symbolic representations
 for use with a future Game Engine I'm working on. Compiled assets support analytical ray tracing at O(1)

@@ -15,13 +15,15 @@ logging.basicConfig(
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def run_tests(module_name):
-    """Dispatch to the appropriate test module."""
     if module_name == 'segmentation':
         from tests.test_geometry.test_segmentation import run_all
         run_all()
+    elif module_name == 'scalar_field':
+        from tests.test_geometry.test_scalar_field import run_all
+        run_all()
     else:
         print(f"Unknown test module: '{module_name}'")
-        print("Available: segmentation")
+        print("Available: segmentation, scalar_field")
         sys.exit(1)
 
 def main():
