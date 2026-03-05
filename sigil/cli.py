@@ -21,9 +21,15 @@ def run_tests(module_name):
     elif module_name == 'scalar_field':
         from tests.test_geometry.test_scalar_field import run_all
         run_all()
+    elif module_name == 'gpr':
+        from tests.test_geometry.test_gpr import run_all
+        run_all()
+    elif module_name == 'sparse_regression':
+        from tests.test_geometry.test_sparse_regression import run_all
+        run_all()        
     else:
         print(f"Unknown test module: '{module_name}'")
-        print("Available: segmentation, scalar_field")
+        print("Available: segmentation, scalar_field, gpr, sparse_regression")
         sys.exit(1)
 
 def main():
