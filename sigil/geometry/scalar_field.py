@@ -4,6 +4,7 @@
 
 import numpy as np
 import logging
+import trimesh
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +66,26 @@ def get_sample_count(patch_faces, mesh,
 # ---------------------------------------------------------------------------
 # Surface sampling
 # ---------------------------------------------------------------------------
+
+def sample_mesh_sdf(mesh, n_surface=10000, epsilon=0.01):
+    # Surface points: f = 0
+    pts_surface, face_idx = trimesh.sample.sample_surface(mesh, n_surface)
+    face_normals = mesh.face_normals[face_idx]
+    
+    # Outside points: f = +epsilon
+    pts_outside = pts_surface + epsilon * face_normals
+    
+    # Inside points: f = -epsilon
+    pts_inside  = pts_surface - epsilon * face_normals
+    
+    X = np.vstack([pts_surface, pts_outside, pts_inside])
+    y = np.concatenate([
+        np.zeros(n_surface),
+        np.full(n_surface,  epsilon),
+        np.full(n_surface, -epsilon),
+    ])
+    return X, y
+
 
 def sample_surface(patch_faces, mesh, n_samples, use_gpu=False):
     """

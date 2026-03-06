@@ -2,7 +2,9 @@
 # Imports
 # ---------------------------------------------------------------------------
 
+from sigil.geometry.sr.base import _denormalize_expr
 from sigil.geometry.sr.base import *
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Lasso fit (Phase 1)
@@ -120,7 +122,10 @@ def _refine_torch(Phi, y, alphas_sparse, n_steps=500, lr=1e-3):
 
     optimizer = torch.optim.Adam([params], lr=lr)
 
-    for step in range(n_steps):
+    pbar = tqdm(range(n_steps), desc=f"Refining {len(params)} params", 
+                    unit="step", leave=False)        
+
+    for step in pbar:
         optimizer.zero_grad()
 
         y_pred = Phi_t @ params                # (N,) -- matrix-vector product
@@ -128,6 +133,8 @@ def _refine_torch(Phi, y, alphas_sparse, n_steps=500, lr=1e-3):
 
         loss.backward()
         optimizer.step()
+
+    pbar.close()
 
     # Write refined values back into full alphas array
     alphas_refined = alphas_sparse.copy()
@@ -243,14 +250,15 @@ class SparseRegressionBackend(SRBackend):
                       f"rmse={rmse:.6f}, "
                       f"expr={sympy_expr}")
 
-        eq = Equation(
-            sympy_expr    = sympy_expr,
+        # After building sympy_expr from normalized alphas:
+        sympy_expr_world = _denormalize_expr(sympy_expr, center, scale)
+        sympy_expr_world = sympy.expand(sympy_expr_world)
+
+        return Equation(
+            sympy_expr    = sympy_expr_world,   # world coordinates
             rmse          = rmse,
             degree        = self.degree,
             alphas        = alphas_refined,
             feature_names = feature_names,
+            # no _center, no _scale
         )
-        # Store normalization parameters so __call__ can apply them
-        eq._center = center
-        eq._scale  = scale
-        return eq

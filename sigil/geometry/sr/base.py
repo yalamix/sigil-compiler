@@ -13,6 +13,10 @@ import sympy
 from sklearn.preprocessing import PolynomialFeatures
 import re
 import logging
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.simplefilter("ignore", category=ConvergenceWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +26,19 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 # Equation
 # ---------------------------------------------------------------------------
+
+def _replace_abs(expr):
+    """
+    Replace Abs(x) with sqrt(x**2 + 1e-8) throughout the expression.
+    This is smooth and differentiable everywhere, unlike Abs which has
+    a non-differentiable kink at 0. The 1e-8 prevents sqrt(0) gradient issues.
+    lambdify handles sqrt natively via numpy.
+    """
+    return expr.replace(
+        sympy.Abs,
+        lambda x: sympy.sqrt(x**2 + sympy.Float(1e-8))
+    )
+
 
 @dataclass
 class Equation:
@@ -78,55 +95,46 @@ class Equation:
         """
         if self._compiled_fn is None:
             x0, x1, x2 = sympy.symbols('x0 x1 x2')
+            logging.info("Lambdifying expression...")
             self._compiled_fn = sympy.lambdify(
                 [x0, x1, x2],
                 self.sympy_expr,
                 modules='numpy'
             )
-
-        # Apply normalization if this equation was fitted on normalized coords
-        center = getattr(self, '_center', None)
-        scale  = getattr(self, '_scale',  1.0)
-        if center is not None:
-            points = (points - center) / scale
-
+            logging.info("Lambdify complete.")
         return self._compiled_fn(
-            points[:, 0],   # (N,) -- x0 column
-            points[:, 1],   # (N,) -- x1 column
-            points[:, 2]    # (N,) -- x2 column
+            points[:, 0],
+            points[:, 1],
+            points[:, 2]
         )
 
     def gradient(self, points):
-        """
-        Evaluate the gradient [df/dx0, df/dx1, df/dx2] at query points.
-        This is the surface normal direction: n = grad(f) / ||grad(f)||.
-
-        Computed analytically from sympy_expr via symbolic differentiation,
-        then lambdified. Exact normals -- no finite differences needed.
-
-        points: (N, 3)
-        returns: (N, 3) -- unnormalized gradient vectors
-        """
         if not hasattr(self, '_grad_fns') or self._grad_fns is None:
             x0, x1, x2 = sympy.symbols('x0 x1 x2')
-            df_dx0 = sympy.diff(self.sympy_expr, x0)
-            df_dx1 = sympy.diff(self.sympy_expr, x1)
-            df_dx2 = sympy.diff(self.sympy_expr, x2)
+            expr = _replace_abs(self.sympy_expr)
+            df_dx0 = sympy.diff(expr, x0)
+            df_dx1 = sympy.diff(expr, x1)
+            df_dx2 = sympy.diff(expr, x2)
             self._grad_fns = [
                 sympy.lambdify([x0, x1, x2], df_dx0, modules='numpy'),
                 sympy.lambdify([x0, x1, x2], df_dx1, modules='numpy'),
                 sympy.lambdify([x0, x1, x2], df_dx2, modules='numpy'),
             ]
 
-        # Apply normalization if this equation was fitted on normalized coords
-        center = getattr(self, '_center', None)
-        scale  = getattr(self, '_scale',  1.0)
-        if center is not None:
-            points = (points - center) / scale
+        N = len(points)
 
-        g0 = self._grad_fns[0](points[:, 0], points[:, 1], points[:, 2])
-        g1 = self._grad_fns[1](points[:, 0], points[:, 1], points[:, 2])
-        g2 = self._grad_fns[2](points[:, 0], points[:, 1], points[:, 2])
+        def _eval(fn, pts):
+            result = fn(pts[:, 0], pts[:, 1], pts[:, 2])
+            # sympy may return a scalar (int/float) if the derivative
+            # simplified to a constant -- broadcast to (N,)
+            result = np.asarray(result, dtype=np.float64)
+            if result.ndim == 0:
+                result = np.full(N, float(result))
+            return result
+
+        g0 = _eval(self._grad_fns[0], points)
+        g1 = _eval(self._grad_fns[1], points)
+        g2 = _eval(self._grad_fns[2], points)
 
         return np.column_stack([g0, g1, g2])   # (N, 3)
 
@@ -180,6 +188,32 @@ class SRBackend(ABC):
 # ---------------------------------------------------------------------------
 # Shared feature matrix utility
 # ---------------------------------------------------------------------------
+
+def _denormalize_expr(expr_norm, center, scale):
+    """
+    Convert expression from normalized coordinates back to world coordinates.
+    
+    expr_norm:  sympy expression in normalized space
+    center:     (3,) array -- the normalization center
+    scale:      float -- the normalization scale
+    
+    returns: sympy expression in world coordinates
+    
+    Substitution:
+        x0_norm = (x0_world - center[0]) / scale
+        x1_norm = (x1_world - center[1]) / scale
+        x2_norm = (x2_world - center[2]) / scale
+    """
+    x0, x1, x2 = sympy.symbols('x0 x1 x2')
+    
+    expr_world = expr_norm.subs({
+        x0: (x0 - float(center[0])) / float(scale),
+        x1: (x1 - float(center[1])) / float(scale),
+        x2: (x2 - float(center[2])) / float(scale),
+    })
+
+    return sympy.expand(expr_world)
+
 
 def _feature_name_to_sympy(fname, var_map):
     """

@@ -12,3 +12,4 @@ venv/
 *.ssf
 *.log
 .pytest_cache/
+outputs/

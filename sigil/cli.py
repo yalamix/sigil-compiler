@@ -26,10 +26,22 @@ def run_tests(module_name):
         run_all()
     elif module_name == 'sparse_regression':
         from tests.test_geometry.test_sparse_regression import run_all
+        run_all()
+    elif module_name == 'pysr':
+        from tests.test_geometry.test_pysr_backend import run_all
+        run_all()
+    elif module_name == 'merge':
+        from tests.test_geometry.test_merge import run_all
+        run_all()
+    elif module_name == 'pipeline':
+        from tests.test_pipeline.test_geometry_pipeline import run_all
         run_all()        
+    elif module_name == 'balloon':
+        from tests.test_pipeline.test_balloon_pipeline import run_all
+        run_all()           
     else:
         print(f"Unknown test module: '{module_name}'")
-        print("Available: segmentation, scalar_field, gpr, sparse_regression")
+        print("Available: segmentation, scalar_field, gpr, sparse_regression, pysr, merge")
         sys.exit(1)
 
 def main():
