@@ -8,6 +8,7 @@ import trimesh
 
 from sigil.geometry.scalar_field import sample_mesh_sdf
 from sigil.geometry.sr.base  import build_feature_matrix
+from sigil.pipeline.balloon_eikonal import refine_eikonal
 from sigil.geometry.sr.sparse_regression import (
     _lasso_fit,
     _refine_torch,
@@ -52,6 +53,12 @@ class BalloonConfig:
     # Optional PySR correction on residuals
     use_pysr_correction:  bool = False
     pysr_niterations:     int  = 50
+
+    visualize_progress: bool = False 
+    min_degree_improvement: float = 1e-4
+
+    lambda_eikonal:  float = 0.01
+    lambda_curv:     float = 0
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +153,9 @@ def compile_mesh_balloon(mesh, config=None):
     # (reuse existing normalization)
     X_norm, center, scale = _normalize_X(X)
 
+    from sigil.pipeline.balloon_eikonal import compute_mesh_curvature
+    curvature_target = compute_mesh_curvature(mesh, X[:config.n_surface])
+
     # Stage 2: initialize bounding sphere
     logging.info("Stage 2: initializing bounding sphere")
     r_world = float(np.max(np.linalg.norm(X, axis=1))) * 1.1
@@ -170,68 +180,112 @@ def compile_mesh_balloon(mesh, config=None):
     plateau_count = 0
 
     while True:
-
-        logging.info(
-            f"Degree {degree}: running gradient descent "
-            f"({config.gd_steps} steps, lr={config.gd_lr})"
-        )
-
+        rmse_at_degree_start = rmse
+        # Build feature matrix for current degree
         Phi, feature_names = build_feature_matrix(X_norm, degree)
 
-        # Gradient descent (torch) -- warm start from current alphas
-        alphas = _refine_torch(
-            Phi, y, alphas,
-            n_steps = config.gd_steps,
-            lr      = config.gd_lr,
-        )
+        # Gradient descent
+        # alphas = _refine_torch(Phi, y, alphas,
+        #                     n_steps=config.gd_steps,
+        #                     lr=config.gd_lr)
+
+        alphas = refine_eikonal(
+            X_norm, y, alphas, feature_names, config.n_surface,
+            curvature_target,
+            degree,
+            n_steps        = config.gd_steps,
+            lr             = config.gd_lr,
+            lambda_eikonal = config.lambda_eikonal,
+            lambda_curv    = config.lambda_curv,
+        )        
 
         rmse = _compute_rmse_direct(X_norm, y, alphas, degree)
         logging.info(f"Degree {degree}: rmse={rmse:.6f}")
 
+        coeff_norm = np.linalg.norm(alphas)
+        logging.info(f"  coeff_norm={coeff_norm:.3f}")        
         # Check convergence
         if rmse < config.rmse_threshold:
-            logging.info(
-                f"Converged at degree {degree}, rmse={rmse:.6f}"
-            )
+            logging.info(f"Converged at degree {degree}, rmse={rmse:.6f}")
             break
 
-        # Check degree ceiling
         if degree >= config.max_degree:
-            logging.info(
-                f"Reached max degree {config.max_degree}, "
-                f"rmse={rmse:.6f}"
-            )
+            logging.info(f"Reached max degree {config.max_degree}, rmse={rmse:.6f}")
             break
+
+        # improvement = rmse_at_degree_start - rmse
+        # logging.info(f"Degree {degree}: improvement={improvement:.6f}")
+        # if improvement < config.min_degree_improvement:
+        #     logging.info("Degree no longer helping -- stopping early")
+        #     break
 
         # Check plateau
-        if rmse < best_rmse * 0.99:   # at least 1% improvement
+        if rmse < best_rmse * 0.99:
             best_rmse     = rmse
             plateau_count = 0
         else:
             plateau_count += 1
-            logging.info(
-                f"Plateau detected ({plateau_count}/"
-                f"{config.plateau_patience})"
-            )
+            logging.info(f"Plateau detected ({plateau_count}/{config.plateau_patience})")
 
-        if plateau_count >= config.plateau_patience:
-            if degree >= config.max_degree:
-                logging.info("Max degree reached at plateau -- stopping")
-                break
-            # Increase degree
-            new_degree = degree + config.degree_step
-            logging.info(
-                f"Increasing degree {degree} -> {new_degree}"
-            )
-            alphas        = _expand_alphas(alphas, degree, new_degree)
+        if plateau_count >= config.plateau_patience:            
+            new_degree  = degree + config.degree_step
+            logging.info(f"Increasing degree {degree} -> {new_degree}")
+            old_n       = len(alphas)
+            alphas      = _expand_alphas(alphas, degree, new_degree)
+            
+            # Break zero-gradient deadlock for new terms
+            new_n       = len(alphas)
+            noise_scale = float(np.std(alphas[:old_n])) * 0.01
+            alphas[old_n:] = np.random.randn(new_n - old_n) * noise_scale
+            
             degree        = new_degree
             plateau_count = 0
+            best_rmse     = rmse
 
-        # Sparsify with Lasso before next degree level
-        # (keeps equation lean as degree grows)
-        alphas = _lasso_fit(Phi, y, alphas)
-        alphas = _refine_torch(Phi, y, alphas,
-                               n_steps=200, lr=config.gd_lr)
+        if config.visualize_progress:
+            try:
+                import skimage.measure
+                logging.info("Saving visualization...")
+                res  = 64
+                lin  = np.linspace(-1.5, 1.5, res)
+                xx, yy, zz = np.meshgrid(lin, lin, lin, indexing='ij')
+                X_grid = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
+                
+                Phi_grid, _ = build_feature_matrix(X_grid, degree)
+                f_grid      = (Phi_grid @ alphas).reshape(res, res, res)
+                
+                verts, faces, _, _ = skimage.measure.marching_cubes(f_grid, level=0.0,
+                                                                    spacing=(3.0/res,)*3)
+                verts -= 1.5
+                
+                
+                mesh_approx          = trimesh.Trimesh(verts, faces)
+                mesh_approx.visual.face_colors = [100, 200, 100, 180]  # green, semi-transparent
+                mesh.visual.face_colors        = [200, 100, 100, 180]  # red, semi-transparent
+                
+                mesh_display = mesh.copy()
+                mesh_display.apply_translation([2.0, 0, 0])  # shift original to the right
+                mesh_display.visual.face_colors = [200, 100, 100, 220]  # red
+
+                mesh_approx.visual.face_colors = [100, 200, 100, 220]   # green
+
+                scene = trimesh.Scene([mesh_approx, mesh_display])
+                png   = scene.save_image(resolution=(800, 600))
+
+                mesh_approx.export(
+                    f'C:\\Users\\yalam\\Documents\\sigil-compiler\\outputs\\balloon_progress\\balloon_degree_{degree}_rmse_{rmse:.4f}.obj'
+                )
+                
+                out_path = f'C:\\Users\\yalam\\Documents\\sigil-compiler\\outputs\\balloon_progress\\balloon_degree_{degree}_rmse_{rmse:.4f}.png'
+                with open(out_path, 'wb') as f:
+                    f.write(png)
+                logging.info(f"Saved visualization: {out_path}")
+            except Exception as e:
+                logging.info(f"Visualization save failed: {e}")
+
+    # Phi, feature_names = build_feature_matrix(X_norm, degree)
+    # alphas = _lasso_fit(Phi, y, alphas)
+    # alphas = _refine_torch(Phi, y, alphas, n_steps=500, lr=config.gd_lr)
 
     # Stage 4: optional PySR correction on residuals
     if config.use_pysr_correction and rmse > config.rmse_threshold:
@@ -260,7 +314,7 @@ def compile_mesh_balloon(mesh, config=None):
 
     alphas_pruned = np.where(np.abs(alphas) > PRUNE_THRESHOLD, alphas, 0.0)
 
-    sympy_expr = alphas_to_sympy(alphas, feature_names)
+    sympy_expr = alphas_to_sympy(alphas_pruned, feature_names)
     sympy_expr = _denormalize_expr(sympy_expr, center, scale)
     sympy_expr = sympy.expand(sympy_expr)
 
@@ -291,3 +345,30 @@ def compile_mesh_balloon(mesh, config=None):
         alphas        = alphas,
         feature_names = feature_names,
     )
+
+def compile_mesh_pysr(mesh, config=None):
+    if config is None:
+        config = BalloonConfig()
+
+    # Stage 1: same sampling as balloon
+    X, y = sample_mesh_sdf(
+        mesh,
+        n_surface = config.n_surface,
+        epsilon   = config.epsilon,
+    )
+    logging.info(f"Dataset: {len(X)} points, y range [{y.min():.4f}, {y.max():.4f}]")
+
+    # Stage 2: PySR directly on world coordinates
+    # (PySR backend handles normalization internally)
+    from sigil.geometry.sr.pysr_backend import PySRBackend
+
+    backend = PySRBackend(
+        niterations      = 1000,      # overnight
+        populations      = 30,        # more diverse search
+        batching         = True,
+        batch_size       = 2000,
+    )
+
+    equation = backend.fit(X, y)
+    logging.info(f"PySR result: rmse={equation.rmse:.6f}, expr={equation.sympy_expr}")
+    return equation

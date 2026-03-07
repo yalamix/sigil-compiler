@@ -98,7 +98,8 @@ class PySRBackend(SRBackend):
                 random_state     = self.random_state,
                 tempdir          = tempdir,
                 batching         = self.batching,
-                batch_size       = self.batch_size,                   
+                batch_size       = self.batch_size,
+                maxsize          = 60,
                 delete_tempfiles = True,
                 verbosity        = 1,
                 **extra_kwargs

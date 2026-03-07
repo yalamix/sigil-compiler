@@ -67,23 +67,55 @@ def get_sample_count(patch_faces, mesh,
 # Surface sampling
 # ---------------------------------------------------------------------------
 
-def sample_mesh_sdf(mesh, n_surface=10000, epsilon=0.01):
-    # Surface points: f = 0
+def sample_mesh_sdf(mesh, n_surface=10000, epsilon=0.01, n_volume=10000):
+    """
+    Sample signed distance field from mesh geometry.
+
+    Three layers:
+      - Surface points:       f = 0          (on mesh surface)
+      - Near-surface outside: f = +epsilon   (just outside)
+      - Near-surface inside:  f = -epsilon   (just inside)
+      - Volume points:        f = true SDF   (random points in bounding box,
+                                              clamped to [-5e, +5e])
+
+    The volume points are critical -- without them the polynomial has no
+    constraint away from the surface and produces spurious zero level sets
+    in the interior and exterior.
+    """
+    # --- Surface and near-surface samples ---
     pts_surface, face_idx = trimesh.sample.sample_surface(mesh, n_surface)
-    face_normals = mesh.face_normals[face_idx]
-    
-    # Outside points: f = +epsilon
+    face_normals          = mesh.face_normals[face_idx]
+
     pts_outside = pts_surface + epsilon * face_normals
-    
-    # Inside points: f = -epsilon
     pts_inside  = pts_surface - epsilon * face_normals
-    
-    X = np.vstack([pts_surface, pts_outside, pts_inside])
+
+    # --- Volume samples ---
+    bounds_min = mesh.bounds[0] * 1.2
+    bounds_max = mesh.bounds[1] * 1.2
+    pts_volume = np.random.uniform(bounds_min, bounds_max, (n_volume, 3))
+
+    from trimesh.proximity import signed_distance
+    sd_volume = -signed_distance(mesh, pts_volume)
+
+    # Clamp to [-5*epsilon, +5*epsilon] so volume points don't dominate
+    # the loss over surface points
+    y_volume = np.clip(sd_volume, -5 * epsilon, 5 * epsilon)
+
+    # --- Combine ---
+    X = np.vstack([
+        pts_surface,
+        pts_outside,
+        pts_inside,
+        pts_volume,
+    ]).astype(np.float64)
+
     y = np.concatenate([
         np.zeros(n_surface),
         np.full(n_surface,  epsilon),
         np.full(n_surface, -epsilon),
+        y_volume,
     ])
+
     return X, y
 
 
