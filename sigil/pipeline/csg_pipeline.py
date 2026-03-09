@@ -28,11 +28,26 @@ logging.basicConfig(
     format='%(asctime)s | %(message)s'
 )
 
+objs = [
+    'bunny-low',
+    'bunny-high',
+    'lucy',
+    'fandisk'
+]
+
+created = [
+    'icosphere',
+    'box',
+    'torus'
+]
+
+mesh_option = "bunny-high"
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-MESH_PATH = r'C:\Users\yalam\Documents\sigil-compiler\assets\meshes\fandisk.obj'
+MESH_PATH = r'C:\Users\yalam\Documents\sigil-compiler\assets\meshes\mesh_option.obj'.replace('mesh_option', f'{mesh_option if mesh_option in objs else objs[0]}')
 
 N_INTERIOR      = 50000   # random interior candidate points to sample
                            # more = better medial axis coverage, costs more RAM
@@ -54,10 +69,22 @@ MAX_SPHERES     = 80      # cap for visualization — show only the largest N sp
 # Step 1a: Load and repair mesh
 # ---------------------------------------------------------------------------
 
-logging.info("Loading mesh...")
-# mesh = trimesh.load(MESH_PATH)
-# mesh = trimesh.creation.icosphere(subdivisions=3)
-mesh = trimesh.creation.box(extents=[1.0, 0.6, 0.4])
+logging.info(f"Loading mesh: {mesh_option}")
+
+if mesh_option in objs:
+    mesh = trimesh.load(MESH_PATH)
+elif mesh_option == 'icosphere':
+    mesh = trimesh.creation.icosphere(subdivisions=3)
+elif mesh_option == 'box':
+    mesh = trimesh.creation.box(extents=[1.0, 0.6, 0.4])
+elif mesh_option == 'torus':
+    mesh = trimesh.creation.torus(
+        major_radius=1.0, 
+        minor_radius=0.3,
+        major_sections=128,  # default is 32
+        minor_sections=64,   # default is 16
+    )
+
 logging.info(f"Mesh loaded: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
 
 # Repair before anything else — signed distance and inside tests depend on
@@ -147,7 +174,7 @@ if len(interior_points) < 100:
 # ---------------------------------------------------------------------------
 
 logging.info(f"Sampling {N_SURFACE_KD} surface points for KD-tree...")
-surface_pts, _ = trimesh.sample.sample_surface(mesh, N_SURFACE_KD)
+surface_pts, _ = trimesh.sample.sample_surface(mesh, N_SURFACE_KD, seed=42)
 
 logging.info("Building KD-tree on surface points...")
 kd_tree = scipy.spatial.cKDTree(surface_pts)
@@ -336,178 +363,430 @@ logging.info(f"Saved: {out_path}")
 # logging.info("  - No sphere should visibly protrude outside the red mesh")
 
 # ---------------------------------------------------------------------------
-# Step 2: Primitive type promotion via curvature measures
+# Step 2 (revised): Skeleton graph analysis
 # ---------------------------------------------------------------------------
-# For each medial sphere, query the discrete Gaussian and mean curvature
-# measures from trimesh at the sphere center using the sphere radius.
+# Build an overlap graph where medial spheres are nodes and edges connect
+# spheres whose volumes overlap. Then analyze connected components and their
+# topology to determine primitive types.
 #
-# These measures integrate curvature over the entire sphere neighborhood,
-# so a sphere touching mixed geometry (flat base + curved wall) gets a
-# weighted average — it naturally picks the dominant surface type.
-#
-# After normalizing by ball volume, we get true curvature values:
-#   K_norm = Gaussian curvature ≈ κ1 * κ2
-#   H_norm = Mean curvature    ≈ (κ1 + κ2) / 2
-#
-# Classification:
-#   K ≈ 0, H ≈ 0  -> both principal curvatures flat -> box
-#   K ≈ 0, H large -> one flat, one curved           -> capsule
-#   K large        -> both curved                    -> sphere
-#
-# All thresholds are on normalized curvature values, which are
-# scale-independent because we normalized the mesh to unit bounding box.
+# Two spheres overlap if the distance between their centers is less than
+# the sum of their radii — i.e. they share interior volume.
+# We use a slightly generous factor so near-touching spheres are also connected.
 
 logging.info("=" * 60)
-logging.info("Step 2: Primitive type promotion")
+logging.info("Step 2 (revised): Skeleton graph analysis")
 
-# Thresholds on normalized curvature.
-# These are tuned for a mesh normalized to unit bounding box.
-# K_SPHERE_THRESHOLD:  below this, Gaussian curvature is "flat" in at least one direction
-# H_CAPSULE_THRESHOLD: above this, mean curvature is "curved enough" for a capsule
-K_SPHERE_THRESHOLD  = 0.01   # if K_norm < this -> not a sphere (box or capsule)
-H_CAPSULE_THRESHOLD = 0.05   # if H_norm > this (and K low) -> capsule, else box
-
-# Minimum neighborhood fraction — skip promotion if sphere touches too little surface
-# (avoids classifying primitives in sparse regions with noisy curvature estimates)
-MIN_NEIGHBOR_FRACTION = 0.003   # at least 0.3% of surface points in neighborhood
-MIN_NEIGHBORS         = int(MIN_NEIGHBOR_FRACTION * N_SURFACE_KD)
-
-# Maximum neighborhood fraction — skip promotion if sphere touches too much surface
-# (sphere is so large its neighborhood is the whole mesh, not a local region)
-MAX_NEIGHBOR_FRACTION = 0.15
-MAX_NEIGHBORS         = int(MAX_NEIGHBOR_FRACTION * N_SURFACE_KD)
-
-# Ball volume normalization factor: 4/3 * pi * r^3
-# trimesh returns raw integral over ball, we divide to get curvature density
-def _ball_volume(r):
-    return (4.0 / 3.0) * np.pi * r ** 3
-
-# Build surface KD-tree for neighbor counting
-# (reuse surface_pts from step 1)
 surface_kd = scipy.spatial.cKDTree(surface_pts)
 
-primitives = []
+OVERLAP_FACTOR = 1.1   # two spheres are "connected" if
+                        # dist(c1, c2) < OVERLAP_FACTOR * (r1 + r2)
+                        # > 1.0 catches near-touching spheres too
 
-for i, (center, radius) in enumerate(zip(medial_centers, medial_radii)):
+# ---------------------------------------------------------------------------
+# Build adjacency list
+# ---------------------------------------------------------------------------
 
-    # Count neighbors to decide if this sphere's neighborhood is meaningful
-    neighbor_idx = surface_kd.query_ball_point(center, radius * 2.0)
-    n_neighbors  = len(neighbor_idx)
+n_spheres = len(medial_centers)
 
-    if n_neighbors < MIN_NEIGHBORS or n_neighbors > MAX_NEIGHBORS:
-        # Too few: noisy estimate. Too many: not a local region.
-        # Default to sphere — safe fallback, will be refined in optimization.
-        primitives.append({
-            'type':        'sphere',
-            'center':      center,
-            'radius':      radius,
-            'axis':        None,
-            'half_height': None,
-            'axes':        None,
+# For each sphere, find all others it overlaps with
+adjacency = [[] for _ in range(n_spheres)]
+
+for i in range(n_spheres):
+    for j in range(i + 1, n_spheres):
+        dist = np.linalg.norm(medial_centers[i] - medial_centers[j])
+        if dist < OVERLAP_FACTOR * (medial_radii[i] + medial_radii[j]):
+            adjacency[i].append(j)
+            adjacency[j].append(i)
+
+# Log connectivity for debugging
+degrees = [len(adj) for adj in adjacency]
+logging.info(f"Overlap graph: {n_spheres} nodes, "
+             f"{sum(degrees)//2} edges, "
+             f"mean degree={np.mean(degrees):.1f}, "
+             f"max degree={max(degrees)}")
+
+# ---------------------------------------------------------------------------
+# Find connected components via BFS
+# ---------------------------------------------------------------------------
+
+visited    = np.zeros(n_spheres, dtype=bool)
+components = []   # list of lists of sphere indices
+
+for start in range(n_spheres):
+    if visited[start]:
+        continue
+    # BFS from this node
+    component = []
+    queue     = [start]
+    visited[start] = True
+    while queue:
+        node = queue.pop(0)
+        component.append(node)
+        for neighbor in adjacency[node]:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                queue.append(neighbor)
+    components.append(component)
+
+logging.info(f"Connected components: {len(components)}")
+for ci, comp in enumerate(components):
+    logging.info(f"  Component {ci}: {len(comp)} spheres, "
+                 f"indices={sorted(comp)}")
+
+# ---------------------------------------------------------------------------
+# Analyze each component to determine primitive type
+# ---------------------------------------------------------------------------
+# Pattern recognition on the graph topology and geometry of each component.
+#
+# Patterns (in order of priority):
+#   1. Single node                    -> sphere or ellipsoid
+#   2. Linear chain (high R²)         -> capsule / cylinder / cone
+#   3. Ring (centers fit a circle)    -> torus / capped torus
+#   4. Planar cluster (centers flat)  -> box / disc
+#   5. Branching / complex            -> keep as spheres, beam search handles it
+
+# Thresholds — all dimensionless ratios, scale-independent
+LINE_R2_THRESHOLD    = 0.92   # R² for line fit to be "linear enough"
+CIRCLE_R2_THRESHOLD  = 0.85   # R² for circle fit to be "ring-shaped enough"
+PLANE_FLAT_THRESHOLD = 0.10   # smallest_eigenvalue / largest for "flat enough"
+CONE_SLOPE_THRESHOLD = 0.05   # slope of radius vs position to distinguish
+                               # cone (high slope) from capsule/cylinder (low)
+TAPER_THRESHOLD      = 0.15   # std(radii)/mean(radii) — high = tapered = capsule
+                               #                          low  = uniform = cylinder
+
+
+def _fit_line_r2(points):
+    """
+    Fit a line to 3D points via PCA (first principal component).
+    Returns (axis, r2) where axis is the unit direction and r2 is the
+    fraction of variance explained by the first component.
+    R² close to 1.0 means points are nearly collinear.
+    """
+    centered = points - points.mean(axis=0)
+    _, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    # R² = variance explained by first component / total variance
+    r2 = S[0]**2 / (np.sum(S**2) + 1e-10)
+    return Vt[0], float(r2)
+
+
+def _fit_plane_flatness(points):
+    """
+    Fit a plane to 3D points via PCA.
+    Returns (normal, flatness) where flatness = S[2]/S[0].
+    Flatness close to 0 means points are nearly coplanar.
+    """
+    centered = points - points.mean(axis=0)
+    _, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    flatness = float(S[2] / (S[0] + 1e-10))
+    return Vt[2], flatness   # Vt[2] = normal to best-fit plane
+
+
+def _fit_circle_r2(points, normal):
+    """
+    Fit a circle to 3D points that lie approximately in a plane
+    with the given normal. Projects to 2D, fits circle, returns r2.
+
+    Circle fit via algebraic method (Pratt):
+    Finds center and radius of best-fit circle in 2D.
+    R² = 1 - residual_variance / total_variance
+    """
+    # Project points onto plane perpendicular to normal
+    mean   = points.mean(axis=0)
+    up     = np.array([0,0,1]) if abs(normal[2]) < 0.9 else np.array([0,1,0])
+    u_axis = np.cross(normal, up);  u_axis /= np.linalg.norm(u_axis)
+    v_axis = np.cross(normal, u_axis)
+
+    pts2d = np.column_stack([
+        (points - mean) @ u_axis,
+        (points - mean) @ v_axis,
+    ])   # (n, 2)
+
+    if len(pts2d) < 3:
+        return 0.0, 0.0, mean
+
+    # Algebraic circle fit: minimize ||(x-cx)^2 + (y-cy)^2 - r^2||
+    # Rewrite as linear system: 2cx*x + 2cy*y + (r^2 - cx^2 - cy^2) = x^2+y^2
+    A = np.column_stack([
+        2 * pts2d[:, 0],
+        2 * pts2d[:, 1],
+        np.ones(len(pts2d)),
+    ])
+    b = pts2d[:, 0]**2 + pts2d[:, 1]**2
+
+    result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy          = result[0], result[1]
+    r_fit           = np.sqrt(result[2] + cx**2 + cy**2)
+
+    # R² of the circle fit
+    residuals = np.sqrt((pts2d[:,0]-cx)**2 + (pts2d[:,1]-cy)**2) - r_fit
+    ss_res    = np.sum(residuals**2)
+    ss_tot    = np.sum((np.linalg.norm(pts2d, axis=1)
+                        - np.mean(np.linalg.norm(pts2d, axis=1)))**2)
+    r2        = float(1.0 - ss_res / (ss_tot + 1e-10))
+
+    # Center in 3D
+    center_3d = mean + cx * u_axis + cy * v_axis
+
+    return r2, float(r_fit), center_3d
+
+
+# Store promoted primitives — may replace multiple medial spheres with one
+promoted_primitives = []
+# Track which medial spheres have been consumed by a promoted primitive
+consumed = np.zeros(n_spheres, dtype=bool)
+
+for ci, comp in enumerate(components):
+    centers_c = medial_centers[comp]   # (k, 3) centers of this component
+    radii_c   = medial_radii[comp]     # (k,)   radii of this component
+    k         = len(comp)
+
+    logging.info(f"Analyzing component {ci} ({k} spheres)...")
+
+    # --- Pattern 0: degenerate fully-connected component -> single primitive ---
+    # If nearly every sphere overlaps every other, the medial axis is a plateau
+    # (flat distance field in the interior). This happens for boxes and ellipsoids.
+    # In this case, fit a box directly to the surface points rather than sphere centers,
+    # since the sphere centers are spread across the interior and carry no shape info.
+    mean_degree_c = sum(len(adjacency[idx]) for idx in comp) / k
+    if mean_degree_c / k > 0.5 and k > 5:
+        # Collect surface points near this component's bounding region
+        comp_center = centers_c.mean(axis=0)
+        comp_radius = np.linalg.norm(centers_c - comp_center, axis=1).max() \
+                      + radii_c.max()
+        nearby_surf = surface_kd.query_ball_point(comp_center, comp_radius)
+        local_pts   = surface_pts[nearby_surf]
+
+        _, S, Vt    = np.linalg.svd(local_pts - local_pts.mean(axis=0),
+                                     full_matrices=False)
+        center      = local_pts.mean(axis=0)
+        proj0       = (local_pts - center) @ Vt[0]
+        proj1       = (local_pts - center) @ Vt[1]
+        proj2       = (local_pts - center) @ Vt[2]
+        he0         = float(proj0.max() - proj0.min()) / 2.0
+        he1         = float(proj1.max() - proj1.min()) / 2.0
+        he2         = float(proj2.max() - proj2.min()) / 2.0
+
+        logging.info(f"  mean_degree/k={mean_degree_c/k:.2f} -> "
+                     f"degenerate, fitting box to surface points")
+        logging.info(f"  -> box (half_extents=[{he0:.3f}, {he1:.3f}, {he2:.3f}])")
+        promoted_primitives.append({
+            'type':         'box',
+            'center':       center,
+            'radius':       max(he0, he1),
+            'axis':         Vt[2],
+            'half_height':  he2,
+            'axes':         Vt,
+            'half_extents': np.array([he0, he1, he2]),
+            'source':       comp,
         })
-        logging.info(f"Primitive {i}: r={radius:.3f} neighbors={n_neighbors} "
-                     f"-> sphere (out of range, skipping curvature)")
+        for idx in comp:
+            consumed[idx] = True
         continue
 
-    # Query curvature measures at this sphere center with this sphere radius
-    ball_vol = _ball_volume(radius)
-
-    K_raw = trimesh.curvature.discrete_gaussian_curvature_measure(
-        mesh, [center], radius
-    )[0]
-    H_raw = trimesh.curvature.discrete_mean_curvature_measure(
-        mesh, [center], radius
-    )[0]
-
-    # Normalize by ball volume to get curvature density
-    K_norm = K_raw / (ball_vol + 1e-10)
-    H_norm = H_raw / (ball_vol + 1e-10)
-
-    logging.info(f"Primitive {i}: r={radius:.3f} neighbors={n_neighbors} "
-                 f"K={K_norm:.4f} H={H_norm:.4f}", )
-
-    if abs(K_norm) < K_SPHERE_THRESHOLD:
-        # Gaussian curvature near zero — at least one principal curvature is flat
-
-        if abs(H_norm) > H_CAPSULE_THRESHOLD:
-            # Mean curvature significant — one direction curved, one flat -> capsule
-            # Find the capsule axis via PCA on local surface points
-            # (PCA is reliable here because we already know it's elongated)
-            local_pts   = surface_pts[neighbor_idx]
-            local_mean  = local_pts.mean(axis=0)
-            centered    = local_pts - local_mean
-            _, S, Vt    = np.linalg.svd(centered, full_matrices=False)
-
-            axis        = Vt[0]   # direction of most variance = capsule long axis
-            projections = centered @ axis
-            half_height = float(projections.max() - projections.min()) / 2.0
-
-            primitives.append({
-                'type':        'capsule',
-                'center':      center,
-                'radius':      radius,
-                'axis':        axis,
-                'half_height': half_height,
-                'axes':        Vt,
-            })
-            logging.info(f"  -> capsule (axis={axis.round(2)}, "
-                         f"half_height={half_height:.3f})")
-
-        else:
-            # Both curvatures near zero -> flat region -> box
-            # Box orientation from PCA — normal is axis of least variance
-            local_pts   = surface_pts[neighbor_idx]
-            local_mean  = local_pts.mean(axis=0)
-            centered    = local_pts - local_mean
-            _, S, Vt    = np.linalg.svd(centered, full_matrices=False)
-
-            # Vt[2] = least variance direction = normal to the flat face
-            normal      = Vt[2]
-            projections = centered @ normal
-            half_height = float(projections.max() - projections.min()) / 2.0
-
-            # Planar half-extents from the two larger PCA axes
-            proj0       = centered @ Vt[0]
-            proj1       = centered @ Vt[1]
-            half_ext0   = float(proj0.max() - proj0.min()) / 2.0
-            half_ext1   = float(proj1.max() - proj1.min()) / 2.0
-
-            primitives.append({
-                'type':        'box',
-                'center':      center,
-                'radius':      max(half_ext0, half_ext1),  # larger planar extent
-                'axis':        normal,
-                'half_height': half_height,
-                'axes':        Vt,
-                'half_extents': np.array([half_ext0, half_ext1, half_height]),
-            })
-            logging.info(f"  -> box (normal={normal.round(2)}, "
-                         f"half_extents={[round(half_ext0,3), round(half_ext1,3), round(half_height,3)]})")
-
-    else:
-        # Gaussian curvature significant -> both directions curved -> sphere
-        primitives.append({
+    # --- Pattern 1: single node ---
+    if k == 1:
+        idx = comp[0]
+        promoted_primitives.append({
             'type':        'sphere',
-            'center':      center,
-            'radius':      radius,
+            'center':      medial_centers[idx],
+            'radius':      medial_radii[idx],
             'axis':        None,
             'half_height': None,
             'axes':        None,
+            'source':      [idx],
         })
-        logging.info(f"  -> sphere")
+        consumed[idx] = True
+        logging.info(f"  -> sphere (single node)")
+        continue
 
-# Count types for logging
+    # --- Pattern 2: linear chain ---
+    axis, line_r2 = _fit_line_r2(centers_c)
+    logging.info(f"  Line R²={line_r2:.3f}")
+
+    if line_r2 >= LINE_R2_THRESHOLD:
+        # Project centers onto fitted axis to find extent
+        mean_c      = centers_c.mean(axis=0)
+        projections = (centers_c - mean_c) @ axis
+        half_height = float(projections.max() - projections.min()) / 2.0
+        center      = mean_c + axis * (projections.max() + projections.min()) / 2.0
+
+        # Mean radius for the primitive
+        mean_radius = float(radii_c.mean())
+
+        # Distinguish capsule / cylinder / cone by radius variation
+        # Sort spheres along axis and check radius trend
+        order       = np.argsort(projections)
+        radii_sorted = radii_c[order]
+        pos_sorted   = projections[order]
+
+        # Fit line to radius vs position — slope indicates cone taper
+        if len(pos_sorted) >= 2:
+            slope = np.polyfit(pos_sorted, radii_sorted, 1)[0]
+        else:
+            slope = 0.0
+
+        radius_cv = float(np.std(radii_c) / (np.mean(radii_c) + 1e-10))
+
+        if abs(slope) > CONE_SLOPE_THRESHOLD and radius_cv > TAPER_THRESHOLD:
+            # Radii change monotonically along axis -> cone
+            ptype    = 'cone'
+            r_bottom = float(radii_sorted[-1])   # larger end
+            r_top    = float(radii_sorted[0])    # smaller end
+            if slope < 0:
+                r_bottom, r_top = r_top, r_bottom
+            logging.info(f"  -> cone (r_top={r_top:.3f}, r_bottom={r_bottom:.3f}, "
+                         f"slope={slope:.3f})")
+            promoted_primitives.append({
+                'type':        'cone',
+                'center':      center,
+                'radius':      mean_radius,
+                'r_top':       r_top,
+                'r_bottom':    r_bottom,
+                'axis':        axis,
+                'half_height': half_height,
+                'axes':        None,
+                'source':      comp,
+            })
+
+        elif radius_cv < TAPER_THRESHOLD:
+            # Uniform radii -> cylinder
+            logging.info(f"  -> cylinder (r={mean_radius:.3f}, "
+                         f"half_height={half_height:.3f})")
+            promoted_primitives.append({
+                'type':        'cylinder',
+                'center':      center,
+                'radius':      mean_radius,
+                'axis':        axis,
+                'half_height': half_height,
+                'axes':        None,
+                'source':      comp,
+            })
+
+        else:
+            # Tapered ends -> capsule
+            logging.info(f"  -> capsule (r={mean_radius:.3f}, "
+                         f"half_height={half_height:.3f})")
+            promoted_primitives.append({
+                'type':        'capsule',
+                'center':      center,
+                'radius':      mean_radius,
+                'axis':        axis,
+                'half_height': half_height,
+                'axes':        None,
+                'source':      comp,
+            })
+
+        for idx in comp:
+            consumed[idx] = True
+        continue
+
+    # --- Pattern 3: ring (torus) ---
+    # First check if centers are roughly coplanar
+    normal, flatness = _fit_plane_flatness(centers_c)
+    logging.info(f"  Plane flatness={flatness:.3f}")
+
+    if flatness < 0.3 and k >= 4:
+        # Coplanar enough — try circle fit
+        circle_r2, major_radius, circle_center = _fit_circle_r2(centers_c, normal)
+        logging.info(f"  Circle R²={circle_r2:.3f}, major_r={major_radius:.3f}")
+
+        if circle_r2 >= CIRCLE_R2_THRESHOLD:
+            minor_radius = float(radii_c.mean())
+
+            # Check if it's a full ring or partial (capped torus)
+            # Compute angular span of centers around circle center
+            mean_c   = centers_c.mean(axis=0)
+            up       = np.array([0,0,1]) if abs(normal[2]) < 0.9 else np.array([0,1,0])
+            u_axis   = np.cross(normal, up);  u_axis /= np.linalg.norm(u_axis)
+            v_axis   = np.cross(normal, u_axis)
+            vecs     = centers_c - circle_center
+            angles   = np.arctan2(vecs @ v_axis, vecs @ u_axis)
+            angles   = np.sort(angles)
+            # Angular span: largest gap between consecutive angles
+            gaps     = np.diff(angles)
+            gaps     = np.append(gaps, angles[0] + 2*np.pi - angles[-1])
+            max_gap  = float(gaps.max())
+            is_full_ring = max_gap < np.pi / 2   # gap < 90° -> full ring
+
+            ptype = 'torus' if is_full_ring else 'capped_torus'
+            logging.info(f"  -> {ptype} (major_r={major_radius:.3f}, "
+                         f"minor_r={minor_radius:.3f}, "
+                         f"max_gap={np.degrees(max_gap):.1f}°)")
+            promoted_primitives.append({
+                'type':         ptype,
+                'center':       circle_center,
+                'radius':       minor_radius,
+                'major_radius': major_radius,
+                'axis':         normal,   # torus symmetry axis
+                'half_height':  None,
+                'axes':         None,
+                'source':       comp,
+            })
+            for idx in comp:
+                consumed[idx] = True
+            continue
+
+    # --- Pattern 4: planar cluster (box) ---
+    if flatness < PLANE_FLAT_THRESHOLD and k >= 6:
+        _, S, Vt = np.linalg.svd(centers_c - centers_c.mean(axis=0),
+                                  full_matrices=False)
+        # Box half-extents from point cloud extent along each axis
+        center   = centers_c.mean(axis=0)
+        proj0    = (centers_c - center) @ Vt[0]
+        proj1    = (centers_c - center) @ Vt[1]
+        proj2    = (centers_c - center) @ Vt[2]
+        he0      = float(proj0.max() - proj0.min()) / 2.0 + float(radii_c.mean())
+        he1      = float(proj1.max() - proj1.min()) / 2.0 + float(radii_c.mean())
+        he2      = float(proj2.max() - proj2.min()) / 2.0 + float(radii_c.mean())
+
+        logging.info(f"  -> box (half_extents=[{he0:.3f}, {he1:.3f}, {he2:.3f}])")
+        promoted_primitives.append({
+            'type':         'box',
+            'center':       center,
+            'radius':       max(he0, he1),
+            'axis':         Vt[2],
+            'half_height':  he2,
+            'axes':         Vt,
+            'half_extents': np.array([he0, he1, he2]),
+            'source':       comp,
+        })
+        for idx in comp:
+            consumed[idx] = True
+        continue
+
+    # --- Pattern 5: complex / branching -> keep as individual spheres ---
+    logging.info(f"  -> complex component, keeping as {k} individual spheres")
+    for idx in comp:
+        promoted_primitives.append({
+            'type':        'sphere',
+            'center':      medial_centers[idx],
+            'radius':      medial_radii[idx],
+            'axis':        None,
+            'half_height': None,
+            'axes':        None,
+            'source':      [idx],
+        })
+        consumed[idx] = True
+
+# Sanity check: all medial spheres must be consumed
+assert np.all(consumed), "Some medial spheres were not assigned to a primitive"
+
 type_counts = {}
-for p in primitives:
+for p in promoted_primitives:
     type_counts[p['type']] = type_counts.get(p['type'], 0) + 1
-logging.info(f"Primitive types after promotion: {type_counts}")
+logging.info(f"Promoted primitives: {type_counts}")
+logging.info(f"Total: {len(promoted_primitives)} primitives "
+             f"from {n_spheres} medial spheres")
+
+# logging.info("Skipping visualization for now. End.")
+# quit()
 
 # ---------------------------------------------------------------------------
 # Step 2 sanity checks
 # ---------------------------------------------------------------------------
 
 # All capsule axes should be unit vectors
-for i, p in enumerate(primitives):
+for i, p in enumerate(promoted_primitives):
     if p['axis'] is not None:
         norm = np.linalg.norm(p['axis'])
         assert abs(norm - 1.0) < 1e-5, \
@@ -516,7 +795,7 @@ for i, p in enumerate(primitives):
 logging.info("Sanity check passed: all axes are unit vectors")
 
 # Half heights should be positive
-for i, p in enumerate(primitives):
+for i, p in enumerate(promoted_primitives):
     if p['half_height'] is not None:
         assert p['half_height'] > 0, \
             f"Primitive {i} has non-positive half_height: {p['half_height']}"
@@ -657,17 +936,23 @@ def _add_capsule(fig, center, radius, axis, half_height, color, name,
 
 
 def _add_box(fig, center, radius, axis, half_height, axes_mat, color, name,
-             showlegend=False):
+             showlegend=False, half_extents=None):
     """
     Add an oriented box to a plotly figure.
     axes_mat rows are the three principal axes (from PCA).
     radius = half-extent in the two planar directions.
     half_height = half-extent in the normal direction.
     """
+    # Use per-axis half extents if available, otherwise fall back to radius
+    if half_extents is not None:
+        e0, e1, e2 = half_extents
+    else:
+        e0 = e1 = radius
+        e2 = half_height    
     # 8 corners of the box in local frame, then rotate to world
-    a0 = axes_mat[0] * radius        # half-extent along first axis
-    a1 = axes_mat[1] * radius        # half-extent along second axis
-    a2 = axes_mat[2] * half_height   # half-extent along normal
+    a0 = axes_mat[0] * e0        # half-extent along first axis
+    a1 = axes_mat[1] * e1        # half-extent along second axis
+    a2 = axes_mat[2] * e2        # half-extent along normal
 
     corners = np.array([
         center + s0*a0 + s1*a1 + s2*a2
@@ -698,11 +983,75 @@ def _add_box(fig, center, radius, axis, half_height, axes_mat, color, name,
     ))
 
 
+def _add_torus(fig, center, major_radius, minor_radius, axis, color, name,
+               showlegend=False):
+    """
+    Tessellate a torus and add to plotly figure.
+    major_radius: distance from torus center to tube center
+    minor_radius: radius of the tube
+    axis: symmetry axis (normal to the torus plane)
+    """
+    # Build local frame perpendicular to axis
+    axis  = axis / (np.linalg.norm(axis) + 1e-10)
+    up    = np.array([0,0,1]) if abs(axis[2]) < 0.9 else np.array([0,1,0])
+    u_ax  = np.cross(axis, up);  u_ax /= np.linalg.norm(u_ax)
+    v_ax  = np.cross(axis, u_ax)
+
+    # Two angular parameters:
+    # phi: angle around the torus ring (major circle)
+    # theta: angle around the tube (minor circle)
+    n_phi   = 32
+    n_theta = 16
+    phi     = np.linspace(0, 2*np.pi, n_phi,   endpoint=False)
+    theta   = np.linspace(0, 2*np.pi, n_theta, endpoint=False)
+    pp, tt  = np.meshgrid(phi, theta)   # (n_theta, n_phi)
+
+    # Torus parametric equation in local frame:
+    # point = center
+    #       + (major_r + minor_r*cos(theta)) * (cos(phi)*u_ax + sin(phi)*v_ax)
+    #       + minor_r*sin(theta) * axis
+    r       = major_radius + minor_radius * np.cos(tt)
+    x       = center[0] + r*np.cos(pp)*u_ax[0] + r*np.sin(pp)*v_ax[0] \
+              + minor_radius*np.sin(tt)*axis[0]
+    y       = center[1] + r*np.cos(pp)*u_ax[1] + r*np.sin(pp)*v_ax[1] \
+              + minor_radius*np.sin(tt)*axis[1]
+    z       = center[2] + r*np.cos(pp)*u_ax[2] + r*np.sin(pp)*v_ax[2] \
+              + minor_radius*np.sin(tt)*axis[2]
+
+    # Build triangle indices for the (n_theta, n_phi) grid
+    # wraps around in both directions
+    ti, tj, tk = [], [], []
+    for i in range(n_theta):
+        for j in range(n_phi):
+            a  = i * n_phi + j
+            b  = i * n_phi + (j+1) % n_phi
+            c_ = ((i+1) % n_theta) * n_phi + j
+            d  = ((i+1) % n_theta) * n_phi + (j+1) % n_phi
+            ti += [a,  a]
+            tj += [b,  c_]
+            tk += [c_, d]
+
+    fig.add_trace(go.Mesh3d(
+        x=x.ravel(), y=y.ravel(), z=z.ravel(),
+        i=ti, j=tj, k=tk,
+        color=color, opacity=0.6,
+        name=name, showlegend=showlegend,
+    ))
+
+
 # --- Draw all primitives ---
-type_colors = {'sphere': 'blue', 'capsule': 'green', 'box': 'orange'}
+type_colors = {
+    'sphere':   'blue',
+    'capsule':  'green',
+    'cylinder': 'cyan',
+    'cone':     'purple',
+    'box':      'orange',
+    'torus':    'magenta',
+    'capped_torus': 'pink',
+}
 type_seen   = set()
 
-for i, p in enumerate(primitives):
+for i, p in enumerate(promoted_primitives):
     ptype  = p['type']
     color  = type_colors[ptype]
     name   = f"{ptype}_{i} r={p['radius']:.3f}"
@@ -718,7 +1067,20 @@ for i, p in enumerate(primitives):
 
     elif ptype == 'box':
         _add_box(fig2, p['center'], p['radius'],
-                 p['axis'], p['half_height'], p['axes'], color, name, show)
+                p['axis'], p['half_height'], p['axes'], color, name, show,
+                half_extents=p.get('half_extents'))
+
+    elif ptype in ('torus', 'capped_torus'):
+        _add_torus(fig2, p['center'], p['major_radius'], p['radius'],
+                p['axis'], color, name, show)
+
+    elif ptype == 'cylinder':
+        _add_capsule(fig2, p['center'], p['radius'],
+                    p['axis'], p['half_height'], color, name, show)
+
+    elif ptype == 'cone':
+        _add_capsule(fig2, p['center'], p['radius'],
+                    p['axis'], p['half_height'], color, name, show)        
 
 fig2.update_layout(
     title  = (f"Step 2: Primitive promotion — "
@@ -733,8 +1095,457 @@ fig2.update_layout(
 out_path2 = 'medial_axis_step2.html'
 fig2.write_html(out_path2)
 logging.info(f"Saved: {out_path2}")
-logging.info("What to look for:")
-logging.info("  - Ear regions on bunny should show green capsules")
-logging.info("  - Torso/limb columns on Lucy should show green capsules")
-logging.info("  - Flat regions (robes, base) may show orange boxes")
-logging.info("  - Round body regions should stay blue spheres")
+# logging.info("What to look for:")
+# logging.info("  - Ear regions on bunny should show green capsules")
+# logging.info("  - Torso/limb columns on Lucy should show green capsules")
+# logging.info("  - Flat regions (robes, base) may show orange boxes")
+# logging.info("  - Round body regions should stay blue spheres")
+
+# ---------------------------------------------------------------------------
+# SDF evaluators for each primitive type
+# ---------------------------------------------------------------------------
+# All primitives are in normalized mesh coordinates (unit bounding box).
+# Each function takes (points: (n,3)) and returns (n,) signed distances.
+# We only need the zero set to be correct — not true SDFs everywhere.
+
+def _sdf_sphere(points, center, radius, **kwargs):
+    return np.linalg.norm(points - center, axis=1) - radius
+
+
+def _sdf_capsule(points, center, radius, axis, half_height, **kwargs):
+    # Project onto axis, clamp to segment, measure distance to nearest point
+    axis     = axis / (np.linalg.norm(axis) + 1e-10)
+    pa       = points - (center - axis * half_height)
+    ba       = axis * 2.0 * half_height
+    t        = np.clip(np.dot(pa, ba) / (np.dot(ba, ba) + 1e-10), 0.0, 1.0)
+    nearest  = (center - axis * half_height) + t[:, None] * ba
+    return np.linalg.norm(points - nearest, axis=1) - radius
+
+
+def _sdf_cylinder(points, center, radius, axis, half_height, **kwargs):
+    axis     = axis / (np.linalg.norm(axis) + 1e-10)
+    delta    = points - center
+    along    = np.dot(delta, axis)
+    radial   = np.linalg.norm(delta - along[:, None] * axis, axis=1)
+    d_radial = radial - radius
+    d_axial  = np.abs(along) - half_height
+    # Inigo Quilez cylinder SDF
+    return (np.sqrt(np.maximum(d_radial, 0)**2 + np.maximum(d_axial, 0)**2)
+            + np.minimum(np.maximum(d_radial, d_axial), 0))
+
+
+def _sdf_box(points, center, axes, half_extents, **kwargs):
+    # Transform points into box local frame
+    delta  = points - center
+    # Project onto each box axis
+    q      = np.column_stack([
+        np.abs(delta @ axes[0]) - half_extents[0],
+        np.abs(delta @ axes[1]) - half_extents[1],
+        np.abs(delta @ axes[2]) - half_extents[2],
+    ])
+    return (np.linalg.norm(np.maximum(q, 0), axis=1)
+            + np.minimum(np.max(q, axis=1), 0))
+
+
+def _sdf_torus(points, center, major_radius, radius, axis, **kwargs):
+    axis     = axis / (np.linalg.norm(axis) + 1e-10)
+    delta    = points - center
+    along    = np.dot(delta, axis)
+    radial   = np.linalg.norm(delta - along[:, None] * axis, axis=1)
+    # Distance to the torus tube center circle
+    return np.sqrt((radial - major_radius)**2 + along**2) - radius
+
+
+def _sdf_cone(points, center, axis, half_height, r_bottom, r_top, **kwargs):
+    # Capped cone — Inigo Quilez formulation
+    axis     = axis / (np.linalg.norm(axis) + 1e-10)
+    a        = center - axis * half_height   # bottom center
+    b        = center + axis * half_height   # top center
+    pa       = points - a
+    ba       = b - a
+    baba     = np.dot(ba, ba)
+    paba     = np.dot(pa, ba) / (baba + 1e-10)
+    t        = np.clip(paba, 0.0, 1.0)
+    # Radius at each projected point along axis
+    r        = r_bottom + (r_top - r_bottom) * t
+    radial   = np.linalg.norm(pa - t[:, None] * ba, axis=1)
+    return radial - r
+
+
+# Dispatch table
+_SDF_DISPATCH = {
+    'sphere':       _sdf_sphere,
+    'capsule':      _sdf_capsule,
+    'cylinder':     _sdf_cylinder,
+    'box':          _sdf_box,
+    'torus':        _sdf_torus,
+    'capped_torus': _sdf_torus,   # same evaluator, uses major_radius
+    'cone':         _sdf_cone,
+}
+
+
+def eval_primitive(points, primitive):
+    """Evaluate SDF of a single primitive at given points. Returns (n,) array."""
+    fn = _SDF_DISPATCH.get(primitive['type'])
+    if fn is None:
+        raise ValueError(f"Unknown primitive type: {primitive['type']}")
+    return fn(points, **primitive)
+
+
+def eval_union(points, primitives, k_smooth=32.0):
+    """
+    Evaluate smooth union (smin) of all primitives at given points.
+    k_smooth: smoothness parameter — higher = sharper joins.
+    Returns (n,) array of SDF values.
+    """
+    if not primitives:
+        return np.full(len(points), np.inf)
+    # Start with first primitive
+    result = eval_primitive(points, primitives[0])
+    for prim in primitives[1:]:
+        d2  = eval_primitive(points, prim)
+        # Inigo Quilez polynomial smooth minimum
+        h   = np.clip(0.5 + 0.5 * (d2 - result) / (1.0 / k_smooth), 0.0, 1.0)
+        result = d2 * (1.0 - h) + result * h - (1.0 / k_smooth) * h * (1.0 - h)
+    return result
+
+
+def coverage_mask(points, primitives, epsilon=0.02):
+    """
+    Returns boolean mask: True where smin_union(x) <= epsilon.
+    These are the 'explained' surface points.
+    """
+    if not primitives:
+        return np.zeros(len(points), dtype=bool)
+    sdf = eval_union(points, primitives)
+    return np.abs(sdf) <= epsilon
+
+
+def coverage_fraction(points, primitives, epsilon=0.02):
+    """Fraction of surface points explained by the current primitive set."""
+    return float(coverage_mask(points, primitives, epsilon).mean())
+
+# ---------------------------------------------------------------------------
+# Step 2 coverage report
+# ---------------------------------------------------------------------------
+EPSILON = 0.02
+
+cov = coverage_fraction(surface_pts, promoted_primitives, EPSILON)
+mask = coverage_mask(surface_pts, promoted_primitives, EPSILON)
+logging.info(f"Step 2 coverage: {cov*100:.1f}% of surface points explained "
+             f"({mask.sum()} / {len(surface_pts)})")
+
+# ---------------------------------------------------------------------------
+# Step 3: Greedy beam search on residual surface points
+# ---------------------------------------------------------------------------
+# Repeatedly proposes primitives to cover unexplained surface points.
+# Each iteration:
+#   1. Find residual (unexplained) surface points
+#   2. Cluster them with DBSCAN
+#   3. For each cluster, fit a candidate primitive
+#   4. Score by coverage gain (new points explained)
+#   5. Commit the best candidate
+#   6. Repeat until coverage target or max primitives reached
+
+from sklearn.cluster import DBSCAN
+
+logging.info("=" * 60)
+logging.info("Step 3: Greedy beam search")
+
+# --- Configuration ---
+BEAM_COVERAGE_TARGET  = 0.95    # stop when this fraction of surface is explained
+BEAM_MAX_PRIMITIVES   = 50      # hard cap on primitives added by beam search
+BEAM_MIN_GAIN         = 0.005   # stop if best candidate explains < 0.5% new points
+BEAM_EPSILON          = EPSILON # same epsilon as coverage
+MAX_BEAM_RADIUS       = max(medial_radii)
+
+# DBSCAN parameters — in normalized mesh coordinates
+# eps: two points are neighbors if distance < eps
+# min_samples: minimum points to form a cluster core
+DBSCAN_EPS         = 0.08
+DBSCAN_MIN_SAMPLES = 5
+
+
+def _fit_candidate_sphere(pts):
+    """Fit a bounding sphere to a point cluster using Ritter's algorithm."""
+    center = pts.mean(axis=0)
+    radius = float(np.linalg.norm(pts - center, axis=1).max())
+    # Shrink slightly — local optimization will expand if needed
+    radius *= 0.9
+    radius = min(radius, MAX_BEAM_RADIUS)
+    return {
+        'type':        'sphere',
+        'center':      center,
+        'radius':      radius,
+        'axis':        None,
+        'half_height': None,
+        'axes':        None,
+    }
+
+
+def _fit_candidate_capsule(pts):
+    """Fit a capsule to a point cluster via PCA."""
+    mean    = pts.mean(axis=0)
+    centered = pts - mean
+    _, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    axis    = Vt[0]
+    proj    = centered @ axis
+    half_height = float(proj.max() - proj.min()) / 2.0
+    half_height = min(half_height, MAX_BEAM_RADIUS * 2)
+    center  = mean + axis * (proj.max() + proj.min()) / 2.0
+    # Radius = mean distance from axis
+    along   = np.outer(proj - (proj.max() + proj.min())/2.0, axis)
+    radial  = np.linalg.norm(centered - along, axis=1)
+    radius  = float(np.percentile(radial, 90)) * 0.9
+    radius = min(radius, MAX_BEAM_RADIUS)
+    return {
+        'type':        'capsule',
+        'center':      center,
+        'radius':      radius,
+        'axis':        axis,
+        'half_height': half_height,
+        'axes':        None,
+    }
+
+
+def _fit_candidate_box(pts):
+    """Fit an oriented box to a point cluster via PCA."""
+    mean     = pts.mean(axis=0)
+    centered = pts - mean
+    _, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    proj0    = centered @ Vt[0]
+    proj1    = centered @ Vt[1]
+    proj2    = centered @ Vt[2]
+    max_he = MAX_BEAM_RADIUS
+    he0 = min(float(proj0.max() - proj0.min()) / 2.0, max_he)
+    he1 = min(float(proj1.max() - proj1.min()) / 2.0, max_he)
+    he2 = min(float(proj2.max() - proj2.min()) / 2.0, max_he)
+    return {
+        'type':         'box',
+        'center':       mean,
+        'radius':       max(he0, he1),
+        'axis':         Vt[2],
+        'half_height':  he2,
+        'axes':         Vt,
+        'half_extents': np.array([he0, he1, he2]) * 0.9,
+    }
+
+
+def _propose_candidates(pts):
+    """
+    Given a cluster of residual surface points, propose candidate primitives.
+    Returns list of candidates, each a primitive dict.
+    """
+    candidates = []
+
+    if len(pts) < 3:
+        return candidates
+
+    # Always propose a sphere
+    candidates.append(_fit_candidate_sphere(pts))
+
+    # Propose capsule if cluster is elongated
+    if len(pts) >= 6:
+        centered = pts - pts.mean(axis=0)
+        _, S, _  = np.linalg.svd(centered, full_matrices=False)
+        r2       = S[0]**2 / (np.sum(S**2) + 1e-10)
+        if r2 > 0.5:   # elongated enough to be worth trying
+            candidates.append(_fit_candidate_capsule(pts))
+
+    # Propose box if cluster is planar or blocky
+    if len(pts) >= 6:
+        centered  = pts - pts.mean(axis=0)
+        _, S, _   = np.linalg.svd(centered, full_matrices=False)
+        flatness  = float(S[2] / (S[0] + 1e-10))
+        if flatness < 0.3:
+            candidates.append(_fit_candidate_box(pts))
+
+    return candidates
+
+
+def _coverage_gain(candidate, current_mask, all_surface_pts, epsilon):
+    """
+    Count how many currently-unexplained points this candidate would explain.
+    Returns (gain_fraction, new_mask_contribution)
+    """
+    cand_sdf  = eval_primitive(all_surface_pts, candidate)
+    cand_mask = np.abs(cand_sdf) <= epsilon
+    # Only count points not already explained
+    new_mask  = cand_mask & ~current_mask
+    gain      = float(new_mask.sum()) / len(all_surface_pts)
+    return gain, new_mask
+
+
+def _center_is_inside(center, mesh):
+    from trimesh.ray.ray_util import contains_points as _ray_contains_points
+    directions = [
+        [0.4395064455, 0.617598629942, 0.652231566745],
+        [1,0,0], [0,1,0], [0,0,1], [0.577,0.577,0.577],
+    ]
+    votes = sum(
+        _ray_contains_points(mesh.ray, np.array([center]), np.array([d]))[0]
+        for d in directions
+    )
+    return votes >= 3
+
+
+# --- Main beam search loop ---
+current_primitives = list(promoted_primitives)   # start from step 2 result
+current_mask       = coverage_mask(surface_pts, current_primitives, BEAM_EPSILON)
+current_coverage   = float(current_mask.mean())
+
+logging.info(f"Starting coverage: {current_coverage*100:.1f}%")
+logging.info(f"Target:            {BEAM_COVERAGE_TARGET*100:.1f}%")
+
+n_added = 0
+
+while current_coverage < BEAM_COVERAGE_TARGET and n_added < BEAM_MAX_PRIMITIVES:
+
+    # --- Find residual points ---
+    residual_pts   = surface_pts[~current_mask]
+    residual_idx   = np.where(~current_mask)[0]
+    n_residual     = len(residual_pts)
+
+    logging.info(f"  Iteration {n_added+1}: {n_residual} residual points "
+                 f"({(1-current_coverage)*100:.1f}% uncovered)")
+
+    if n_residual < DBSCAN_MIN_SAMPLES:
+        logging.info("  Too few residual points, stopping.")
+        break
+
+    # --- Cluster residual points ---
+    db      = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES).fit(residual_pts)
+    labels  = db.labels_
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+
+    if n_clusters == 0:
+        logging.info("  No clusters found (all noise), stopping.")
+        break
+
+    logging.info(f"  Found {n_clusters} clusters "
+                 f"(noise: {(labels==-1).sum()} points)")
+
+    # --- Propose and score candidates from each cluster ---
+    best_gain      = 0.0
+    best_candidate = None
+
+    for cluster_id in range(n_clusters):
+        cluster_mask = labels == cluster_id
+        cluster_pts  = residual_pts[cluster_mask]
+
+        candidates = _propose_candidates(cluster_pts)
+
+        for cand in candidates:
+            gain, _ = _coverage_gain(cand, current_mask, surface_pts, BEAM_EPSILON)
+            if gain > best_gain:
+                if _center_is_inside(cand['center'], mesh):
+                    best_gain      = gain
+                    best_candidate = cand
+
+    if best_candidate is None or best_gain < BEAM_MIN_GAIN:
+        logging.info(f"  Best gain {best_gain*100:.2f}% below threshold, stopping.")
+        break
+
+    # --- Commit best candidate ---
+    current_primitives.append(best_candidate)
+    new_prim_sdf  = eval_primitive(surface_pts, best_candidate)
+    new_prim_mask = np.abs(new_prim_sdf) <= BEAM_EPSILON
+    current_mask  = current_mask | new_prim_mask
+    current_coverage = float(current_mask.mean())
+
+    logging.info(f"  Committed {best_candidate['type']} "
+                 f"(gain={best_gain*100:.1f}%, "
+                 f"coverage now {current_coverage*100:.1f}%)")
+    n_added += 1
+
+logging.info(f"Beam search done: added {n_added} primitives, "
+             f"final coverage {current_coverage*100:.1f}%")
+logging.info(f"Total primitives: {len(current_primitives)}")
+
+# ---------------------------------------------------------------------------
+# Step 3 visualization
+# ---------------------------------------------------------------------------
+
+def _visualize_beam_search(fig_primitives, residual_pts, cluster_labels, 
+                            mesh, step_num, primitives):
+    """
+    Visualize current state of beam search:
+    - Mesh (transparent)
+    - Current primitives (colored by type)
+    - Residual points colored by cluster
+    """
+    import plotly.graph_objects as go
+    
+    fig = go.Figure()
+    
+    # --- Mesh ---
+    fig.add_trace(go.Mesh3d(
+        x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
+        i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
+        color='pink', opacity=0.15, name='mesh', showlegend=True,
+    ))
+    
+    # --- Residual points colored by cluster ---
+    unique_labels = sorted(set(cluster_labels))
+    cluster_colors = [
+        '#e6194b','#3cb44b','#ffe119','#4363d8','#f58231',
+        '#911eb4','#42d4f4','#f032e6','#bfef45','#fabed4',
+        '#469990','#dcbeff','#9A6324','#fffac8','#800000',
+        '#aaffc3','#808000','#ffd8b1','#000075','#a9a9a9',
+    ]
+    
+    for label in unique_labels:
+        mask  = cluster_labels == label
+        pts   = residual_pts[mask]
+        color = '#888888' if label == -1 else cluster_colors[label % len(cluster_colors)]
+        name  = 'noise' if label == -1 else f'cluster_{label}'
+        fig.add_trace(go.Scatter3d(
+            x=pts[:,0], y=pts[:,1], z=pts[:,2],
+            mode='markers',
+            marker=dict(size=2, color=color, opacity=0.7),
+            name=name, showlegend=True,
+        ))
+    
+    # --- Current primitives ---
+    type_colors = {
+        'sphere': 'blue', 'capsule': 'green', 'cylinder': 'cyan',
+        'cone': 'purple', 'box': 'orange', 'torus': 'magenta',
+    }
+    
+    for pi, p in enumerate(primitives):
+        ptype = p['type']
+        color = type_colors.get(ptype, 'gray')
+        name  = f"{ptype}_{pi}"
+        show  = pi == 0
+        
+        if ptype == 'sphere':
+            _add_sphere(fig, p['center'], p['radius'], color, name, show)
+        elif ptype in ('capsule', 'cylinder', 'cone'):
+            _add_capsule(fig, p['center'], p['radius'],
+                        p['axis'], p['half_height'], color, name, show)
+        elif ptype == 'box':
+            _add_box(fig, p['center'], p['radius'], p['axis'],
+                    p['half_height'], p['axes'], color, name, show,
+                    half_extents=p.get('half_extents'))
+        elif ptype in ('torus', 'capped_torus'):
+            _add_torus(fig, p['center'], p['major_radius'], p['radius'],
+                      p['axis'], color, name, show)
+    
+    n_types = {}
+    for p in primitives:
+        n_types[p['type']] = n_types.get(p['type'], 0) + 1
+    title = (f"Step 3 iteration {step_num}: "
+             + ", ".join(f"{v} {k}s" for k,v in n_types.items())
+             + f" | coverage {float(current_mask.mean())*100:.1f}%")
+    
+    fig.update_layout(title=title, showlegend=True)
+    fname = f"beam_search_step{step_num:03d}.html"
+    fig.write_html(fname)
+    logging.info(f"  Saved: {fname}")
+
+# Final beam search visualization
+db_final   = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES).fit(
+    surface_pts[~current_mask]
+)
+_visualize_beam_search(None, surface_pts[~current_mask], db_final.labels_,
+                       mesh, n_added, current_primitives)
