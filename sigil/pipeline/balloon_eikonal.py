@@ -95,7 +95,8 @@ def refine_eikonal(
     lr             = 1e-3,
     lambda_eikonal = 0.1,
     lambda_curv    = 0.01,
-    lam_reg        = 1e-4
+    lam_reg        = 1e-4,
+    lambda_sign    = 1
 ):
     """
     Minimize:
@@ -152,7 +153,8 @@ def refine_eikonal(
         f_vals = _eval_poly_from_X(X_t, alpha_t, powers_t)   # (N,)
 
         # L_surface
-        L_surf = torch.mean((f_vals - y_t) ** 2)
+        f_surface = f_vals[:n_surface]
+        L_surf = torch.mean(f_surface ** 2)
 
         # Gradient of f w.r.t. X
         # create_graph=True needed only if we compute curvature (2nd derivs)
@@ -163,8 +165,16 @@ def refine_eikonal(
         )[0]                                              # (N, 3)
 
         grad_mag  = torch.sqrt((grad_f ** 2).sum(dim=1) + 1e-8)
-        grad_mag_surf = torch.sqrt((grad_f[:n_surface] ** 2).sum(dim=1) + 1e-8)
-        L_nondegen = torch.mean(1.0 / (grad_mag_surf + 1e-2))
+        # grad_mag_surf = torch.sqrt((grad_f[:n_surface] ** 2).sum(dim=1) + 1e-8)
+        # L_nondegen = torch.mean(1.0 / (grad_mag_surf + 1e-2))
+
+        # Volume points: sign-only hinge loss
+        n_nonsurface = len(y) - n_surface
+        f_nonsurface = f_vals[n_surface:]
+        y_nonsurface = y_t[n_surface:]   # signs are correct: +ε outside, -ε inside
+
+        # Penalize only sign violations
+        L_sign = torch.mean(torch.relu(-f_nonsurface * torch.sign(y_nonsurface)) ** 2)        
 
         # Curvature loss (surface points only)
         if use_curv:
@@ -195,17 +205,16 @@ def refine_eikonal(
 
         L_reg = torch.sum(alpha_t ** 2)
         lam_reg_effective = lam_reg / (current_degree ** 2)        
-        if current_degree > 4:
-            loss = L_surf + lambda_eikonal * L_nondegen + lambda_curv * L_curv + lam_reg_effective * L_reg
-        else:
-            loss = L_surf + lambda_eikonal * L_nondegen + lambda_curv * L_curv + lam_reg * L_reg
+        
+        loss = L_surf + lambda_sign * L_sign + lambda_curv * L_curv + lam_reg_effective * L_reg
+
         loss.backward()
         optimizer.step()
 
         if step % 200 == 0:
             logging.info(
                 f"  step {step:4d}: surf={L_surf.item():.6f}  "
-                f"nondegen={L_nondegen.item():.6f}  "
+                f"sign={L_sign.item():.6f}  "
                 f"curv={L_curv.item():.6f}  "
                 f"reg={L_reg.item():.6f}  "
                 f"total={loss.item():.6f}"

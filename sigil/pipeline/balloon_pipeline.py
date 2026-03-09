@@ -18,6 +18,7 @@ from sigil.geometry.sr.sparse_regression import (
     alphas_to_sympy,
 )
 from sigil.geometry.sr.base import Equation
+from sigil.geometry.merge import refine_coefficients
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -59,11 +60,39 @@ class BalloonConfig:
 
     lambda_eikonal:  float = 0.01
     lambda_curv:     float = 0
+    lambda_sign: float = 1.0
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def make_sphere_alphas(degree, r_norm):
+    assert degree % 2 == 0
+    
+    x0, x1, x2 = sympy.symbols('x0 x1 x2')
+    c = sympy.Float(0.5)
+    
+    sphere = x0**2 + x1**2 + x2**2 - sympy.Float(r_norm**2)
+    blob   = (x0**2 + x1**2 + x2**2 + c) ** (degree // 2 - 1)
+    f      = sympy.expand(sphere * blob)
+    
+    _, feature_names = build_feature_matrix(np.zeros((1, 3)), degree)
+    
+    # Evaluate f symbolically at each basis monomial by differentiating
+    # Actually: build a small probe set and fit alphas by least squares
+    # since f IS a polynomial in the feature basis
+    rng   = np.random.default_rng(42)
+    X_probe = rng.standard_normal((500, 3))
+    Phi, _  = build_feature_matrix(X_probe, degree)
+    
+    f_lamb  = sympy.lambdify([x0, x1, x2], f, modules='numpy')
+    y_probe = f_lamb(X_probe[:,0], X_probe[:,1], X_probe[:,2])
+    
+    # Exact least squares — f is in the span of Phi by construction
+    alphas, _, _, _ = np.linalg.lstsq(Phi, y_probe, rcond=None)
+    return alphas
+
 
 def _sphere_alphas(r, n_features):
     """
@@ -164,7 +193,10 @@ def compile_mesh_balloon(mesh, config=None):
     _, init_features = build_feature_matrix(
         np.zeros((1, 3)), config.start_degree
     )
-    alphas  = _sphere_alphas(r_norm, len(init_features))
+    if config.start_degree == 2:
+        alphas = _sphere_alphas(r_norm, len(init_features))  # fast path
+    else:
+        alphas = make_sphere_alphas(config.start_degree, r_norm)
     degree  = config.start_degree
 
     rmse = _compute_rmse_direct(X_norm, y, alphas, degree)
@@ -283,9 +315,14 @@ def compile_mesh_balloon(mesh, config=None):
             except Exception as e:
                 logging.info(f"Visualization save failed: {e}")
 
+    # logging.info("Running final Lasso...")
+    # logging.info("Building feature matrix...")
     # Phi, feature_names = build_feature_matrix(X_norm, degree)
+    # logging.info("Lasso fit...")
     # alphas = _lasso_fit(Phi, y, alphas)
+    # logging.info("Refine torch...")
     # alphas = _refine_torch(Phi, y, alphas, n_steps=500, lr=config.gd_lr)
+    # logging.info("Lasso done.")
 
     # Stage 4: optional PySR correction on residuals
     if config.use_pysr_correction and rmse > config.rmse_threshold:
@@ -312,9 +349,9 @@ def compile_mesh_balloon(mesh, config=None):
     # Stage 5: build final equation in world coordinates
     logging.info("Stage 5: building final equation")
 
-    alphas_pruned = np.where(np.abs(alphas) > PRUNE_THRESHOLD, alphas, 0.0)
+    # alphas_pruned = np.where(np.abs(alphas) > PRUNE_THRESHOLD, alphas, 0.0)
 
-    sympy_expr = alphas_to_sympy(alphas_pruned, feature_names)
+    sympy_expr = alphas_to_sympy(alphas, feature_names)
     sympy_expr = _denormalize_expr(sympy_expr, center, scale)
     sympy_expr = sympy.expand(sympy_expr)
 
@@ -350,7 +387,7 @@ def compile_mesh_pysr(mesh, config=None):
     if config is None:
         config = BalloonConfig()
 
-    # Stage 1: same sampling as balloon
+    # Stage 1: sample (same as balloon)
     X, y = sample_mesh_sdf(
         mesh,
         n_surface = config.n_surface,
@@ -358,17 +395,57 @@ def compile_mesh_pysr(mesh, config=None):
     )
     logging.info(f"Dataset: {len(X)} points, y range [{y.min():.4f}, {y.max():.4f}]")
 
-    # Stage 2: PySR directly on world coordinates
-    # (PySR backend handles normalization internally)
+    # Stage 2: subsample for PySR (it's fast per eval but runs thousands of evals)
+    n_surface = config.n_surface
+    surf_idx   = np.arange(n_surface)                          # first n_surface are surface
+    sign_idx   = np.arange(n_surface, len(X))                  # rest are off-surface
+    
+    rng = np.random.default_rng(0)
+    surf_sub  = rng.choice(surf_idx,  size=min(2000, len(surf_idx)),  replace=False)
+    sign_sub  = rng.choice(sign_idx,  size=min(6000, len(sign_idx)),  replace=False)
+    idx       = np.concatenate([surf_sub, sign_sub])
+    
+    X_sub = X[idx]
+    y_raw = y[idx]
+
+    # Stage 3: pack labels — surface gets sentinel 1e6, off-surface keeps sign
+    is_surface = idx < n_surface
+    y_packed   = np.where(is_surface, 1e6, np.sign(y_raw) * config.epsilon)
+
+    logging.info(f"PySR subset: {is_surface.sum()} surface + {(~is_surface).sum()} sign pts")
+
+    # Stage 4: PySR with sign loss
     from sigil.geometry.sr.pysr_backend import PySRBackend
 
+    loss_fn = """
+    function my_loss(tree, dataset, options)
+        X, y = dataset.X, dataset.y
+        f, ok = eval_tree_array(tree, X, options)
+        !ok && return Inf32
+
+        surf_mask = y .> 999.0
+        sign_mask = .!surf_mask
+
+        surf_loss = sum(f[surf_mask] .^ 2) / max(1, sum(surf_mask))
+        margin = 0.1f0
+        sign_vals = f[sign_mask] .* sign.(y[sign_mask])
+        sign_loss = sum(max.(0.0f0, margin .- sign_vals) .^ 2) / max(1, sum(sign_mask))
+        
+        return surf_loss + sign_loss
+    end
+    """
+
     backend = PySRBackend(
-        niterations      = 1000,      # overnight
-        populations      = 30,        # more diverse search
-        batching         = True,
-        batch_size       = 2000,
+        niterations    = 1000,
+        populations    = 30,
+        batching       = False,   # disable — loss is already structural, batching breaks surf/sign balance
+        loss_function  = loss_fn,
     )
 
-    equation = backend.fit(X, y)
+    equation = backend.fit(X_sub, y_packed)
     logging.info(f"PySR result: rmse={equation.rmse:.6f}, expr={equation.sympy_expr}")
+
+    # Stage 5: coefficient refinement on full dataset
+    equation = refine_coefficients(equation, X, y, steps=1000, lr=1e-3, n_surface=config.n_surface)
+
     return equation
