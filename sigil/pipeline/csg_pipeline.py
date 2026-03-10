@@ -1236,211 +1236,309 @@ logging.info(f"Step 2 coverage: {cov*100:.1f}% of surface points explained "
              f"({mask.sum()} / {len(surface_pts)})")
 
 # ---------------------------------------------------------------------------
-# Step 3: Greedy beam search on residual surface points
+# Step 3: GPU-accelerated voxel beam search
 # ---------------------------------------------------------------------------
-# Repeatedly proposes primitives to cover unexplained surface points.
-# Each iteration:
-#   1. Find residual (unexplained) surface points
-#   2. Cluster them with DBSCAN
-#   3. For each cluster, fit a candidate primitive
-#   4. Score by coverage gain (new points explained)
-#   5. Commit the best candidate
-#   6. Repeat until coverage target or max primitives reached
+# Instead of clustering residual surface points (which gives no inside/outside
+# guarantee), we voxelize the mesh interior and search for primitives that
+# explain unexplained interior voxels.
+#
+# All heavy computation runs on GPU via PyTorch.
+# Surface point coverage (ground truth) still uses the existing numpy evaluators.
 
-from sklearn.cluster import DBSCAN
+import torch
 
 logging.info("=" * 60)
-logging.info("Step 3: Greedy beam search")
+logging.info("Step 3: GPU voxel beam search")
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+logging.info(f"Device: {DEVICE}")
 
 # --- Configuration ---
-BEAM_COVERAGE_TARGET  = 0.95    # stop when this fraction of surface is explained
-BEAM_MAX_PRIMITIVES   = 50      # hard cap on primitives added by beam search
-BEAM_MIN_GAIN         = 0.005   # stop if best candidate explains < 0.5% new points
-BEAM_EPSILON          = EPSILON # same epsilon as coverage
-MAX_BEAM_RADIUS       = max(medial_radii)
+VOXEL_RES            = 128      # voxel grid resolution per axis (64^3 = 262k voxels)
+                                # increase to 128 or 256 for higher fidelity
+BEAM_COVERAGE_TARGET = 0.95    # stop when this fraction of surface pts explained
+BEAM_MAX_PRIMITIVES  = 60      # hard cap on primitives added by beam search
+BEAM_MIN_GAIN        = 0.001   # stop if best candidate explains < 0.3% new surface pts
+BEAM_EPSILON         = EPSILON # same epsilon as coverage (0.02)
+MIN_DEPTH            = EPSILON / 2  # ignore voxels shallower than this from surface
+                                    # filters gap voxels between medial spheres and mesh
 
-# DBSCAN parameters — in normalized mesh coordinates
-# eps: two points are neighbors if distance < eps
-# min_samples: minimum points to form a cluster core
-DBSCAN_EPS         = 0.08
-DBSCAN_MIN_SAMPLES = 5
+# ---------------------------------------------------------------------------
+# 3a: Build voxel grid
+# ---------------------------------------------------------------------------
+# Generate a uniform grid of points inside the mesh bounding box,
+# filter to interior, compute surface distance for each.
 
+logging.info(f"Building {VOXEL_RES}^3 voxel grid...")
 
-def _fit_candidate_sphere(pts):
-    """Fit a bounding sphere to a point cluster using Ritter's algorithm."""
-    center = pts.mean(axis=0)
-    radius = float(np.linalg.norm(pts - center, axis=1).max())
-    # Shrink slightly — local optimization will expand if needed
-    radius *= 0.9
-    radius = min(radius, MAX_BEAM_RADIUS)
-    return {
-        'type':        'sphere',
-        'center':      center,
-        'radius':      radius,
-        'axis':        None,
-        'half_height': None,
-        'axes':        None,
-    }
+# Grid coordinates in normalized mesh space
+bb_min_v = mesh.bounds[0]
+bb_max_v = mesh.bounds[1]
 
+xs = np.linspace(bb_min_v[0], bb_max_v[0], VOXEL_RES)
+ys = np.linspace(bb_min_v[1], bb_max_v[1], VOXEL_RES)
+zs = np.linspace(bb_min_v[2], bb_max_v[2], VOXEL_RES)
 
-def _fit_candidate_capsule(pts):
-    """Fit a capsule to a point cluster via PCA."""
-    mean    = pts.mean(axis=0)
-    centered = pts - mean
-    _, S, Vt = np.linalg.svd(centered, full_matrices=False)
-    axis    = Vt[0]
-    proj    = centered @ axis
-    half_height = float(proj.max() - proj.min()) / 2.0
-    half_height = min(half_height, MAX_BEAM_RADIUS * 2)
-    center  = mean + axis * (proj.max() + proj.min()) / 2.0
-    # Radius = mean distance from axis
-    along   = np.outer(proj - (proj.max() + proj.min())/2.0, axis)
-    radial  = np.linalg.norm(centered - along, axis=1)
-    radius  = float(np.percentile(radial, 90)) * 0.9
-    radius = min(radius, MAX_BEAM_RADIUS)
-    return {
-        'type':        'capsule',
-        'center':      center,
-        'radius':      radius,
-        'axis':        axis,
-        'half_height': half_height,
-        'axes':        None,
-    }
+gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
+grid_pts   = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)  # (N, 3)
 
+logging.info(f"Grid points: {len(grid_pts)} total, testing interior...")
 
-def _fit_candidate_box(pts):
-    """Fit an oriented box to a point cluster via PCA."""
-    mean     = pts.mean(axis=0)
-    centered = pts - mean
-    _, S, Vt = np.linalg.svd(centered, full_matrices=False)
-    proj0    = centered @ Vt[0]
-    proj1    = centered @ Vt[1]
-    proj2    = centered @ Vt[2]
-    max_he = MAX_BEAM_RADIUS
-    he0 = min(float(proj0.max() - proj0.min()) / 2.0, max_he)
-    he1 = min(float(proj1.max() - proj1.min()) / 2.0, max_he)
-    he2 = min(float(proj2.max() - proj2.min()) / 2.0, max_he)
-    return {
-        'type':         'box',
-        'center':       mean,
-        'radius':       max(he0, he1),
-        'axis':         Vt[2],
-        'half_height':  he2,
-        'axes':         Vt,
-        'half_extents': np.array([he0, he1, he2]) * 0.9,
-    }
+# Inside test — reuse existing ray caster
+voxel_inside = points_inside_mesh(mesh, grid_pts)
+interior_voxels = grid_pts[voxel_inside]   # (M, 3) only interior points
+logging.info(f"Interior voxels: {len(interior_voxels)} "
+             f"({100*len(interior_voxels)/len(grid_pts):.1f}% fill rate)")
+
+# Surface distance for each interior voxel
+# Reuse the existing surface KD-tree from step 1
+voxel_surf_dist, _ = kd_tree.query(interior_voxels, k=1, workers=-1)
+logging.info(f"Voxel surface distance range: "
+             f"{voxel_surf_dist.min():.4f} — {voxel_surf_dist.max():.4f}")
+
+# Move everything to GPU
+voxels_gpu     = torch.tensor(interior_voxels, dtype=torch.float32, device=DEVICE)
+surf_dist_gpu  = torch.tensor(voxel_surf_dist, dtype=torch.float32, device=DEVICE)
+surface_pts_gpu = torch.tensor(surface_pts,    dtype=torch.float32, device=DEVICE)
+
+logging.info(f"Tensors on {DEVICE}: "
+             f"voxels={voxels_gpu.shape}, surface={surface_pts_gpu.shape}")
+
+# ---------------------------------------------------------------------------
+# 3b: GPU SDF evaluators
+# ---------------------------------------------------------------------------
+# Mirror the numpy SDFs in PyTorch. Same math, tensor ops throughout.
+# All functions take (points: Tensor[N,3]) and return Tensor[N].
+
+def _sdf_sphere_gpu(points, center, radius, **kwargs):
+    c = torch.tensor(center, dtype=torch.float32, device=DEVICE)
+    return torch.norm(points - c, dim=1) - radius
 
 
-def _propose_candidates(pts):
-    """
-    Given a cluster of residual surface points, propose candidate primitives.
-    Returns list of candidates, each a primitive dict.
-    """
-    candidates = []
-
-    if len(pts) < 3:
-        return candidates
-
-    # Always propose a sphere
-    candidates.append(_fit_candidate_sphere(pts))
-
-    # Propose capsule if cluster is elongated
-    if len(pts) >= 6:
-        centered = pts - pts.mean(axis=0)
-        _, S, _  = np.linalg.svd(centered, full_matrices=False)
-        r2       = S[0]**2 / (np.sum(S**2) + 1e-10)
-        if r2 > 0.5:   # elongated enough to be worth trying
-            candidates.append(_fit_candidate_capsule(pts))
-
-    # Propose box if cluster is planar or blocky
-    if len(pts) >= 6:
-        centered  = pts - pts.mean(axis=0)
-        _, S, _   = np.linalg.svd(centered, full_matrices=False)
-        flatness  = float(S[2] / (S[0] + 1e-10))
-        if flatness < 0.3:
-            candidates.append(_fit_candidate_box(pts))
-
-    return candidates
+def _sdf_capsule_gpu(points, center, radius, axis, half_height, **kwargs):
+    ax  = torch.tensor(axis / (np.linalg.norm(axis) + 1e-10),
+                       dtype=torch.float32, device=DEVICE)
+    c   = torch.tensor(center, dtype=torch.float32, device=DEVICE)
+    a   = c - ax * half_height
+    b_  = ax * 2.0 * half_height
+    pa  = points - a
+    t   = torch.clamp((pa @ b_) / (b_ @ b_ + 1e-10), 0.0, 1.0)
+    nearest = a + t.unsqueeze(1) * b_
+    return torch.norm(points - nearest, dim=1) - radius
 
 
-def _coverage_gain(candidate, current_mask, all_surface_pts, epsilon):
-    """
-    Count how many currently-unexplained points this candidate would explain.
-    Returns (gain_fraction, new_mask_contribution)
-    """
-    cand_sdf  = eval_primitive(all_surface_pts, candidate)
-    cand_mask = np.abs(cand_sdf) <= epsilon
-    # Only count points not already explained
-    new_mask  = cand_mask & ~current_mask
-    gain      = float(new_mask.sum()) / len(all_surface_pts)
-    return gain, new_mask
+def _sdf_cylinder_gpu(points, center, radius, axis, half_height, **kwargs):
+    ax    = torch.tensor(axis / (np.linalg.norm(axis) + 1e-10),
+                         dtype=torch.float32, device=DEVICE)
+    c     = torch.tensor(center, dtype=torch.float32, device=DEVICE)
+    delta = points - c
+    along = delta @ ax
+    radial = torch.norm(delta - along.unsqueeze(1) * ax, dim=1)
+    d_rad  = radial - radius
+    d_ax   = torch.abs(along) - half_height
+    return (torch.sqrt(torch.clamp(d_rad, 0)**2 + torch.clamp(d_ax, 0)**2)
+            + torch.min(torch.max(d_rad, d_ax),
+                        torch.zeros_like(d_rad)))
 
 
-def _center_is_inside(center, mesh):
-    from trimesh.ray.ray_util import contains_points as _ray_contains_points
-    directions = [
-        [0.4395064455, 0.617598629942, 0.652231566745],
-        [1,0,0], [0,1,0], [0,0,1], [0.577,0.577,0.577],
-    ]
-    votes = sum(
-        _ray_contains_points(mesh.ray, np.array([center]), np.array([d]))[0]
-        for d in directions
-    )
-    return votes >= 3
+def _sdf_box_gpu(points, center, axes, half_extents, **kwargs):
+    c   = torch.tensor(center,      dtype=torch.float32, device=DEVICE)
+    ax  = torch.tensor(axes,        dtype=torch.float32, device=DEVICE)  # (3,3)
+    he  = torch.tensor(half_extents,dtype=torch.float32, device=DEVICE)  # (3,)
+    delta = points - c
+    q   = torch.stack([
+        torch.abs(delta @ ax[0]) - he[0],
+        torch.abs(delta @ ax[1]) - he[1],
+        torch.abs(delta @ ax[2]) - he[2],
+    ], dim=1)
+    return (torch.norm(torch.clamp(q, min=0), dim=1)
+            + torch.clamp(torch.max(q, dim=1).values, max=0))
 
 
-# --- Main beam search loop ---
-current_primitives = list(promoted_primitives)   # start from step 2 result
-current_mask       = coverage_mask(surface_pts, current_primitives, BEAM_EPSILON)
-current_coverage   = float(current_mask.mean())
+def _sdf_torus_gpu(points, center, major_radius, radius, axis, **kwargs):
+    ax    = torch.tensor(axis / (np.linalg.norm(axis) + 1e-10),
+                         dtype=torch.float32, device=DEVICE)
+    c     = torch.tensor(center, dtype=torch.float32, device=DEVICE)
+    delta = points - c
+    along = delta @ ax
+    radial = torch.norm(delta - along.unsqueeze(1) * ax, dim=1)
+    return torch.sqrt((radial - major_radius)**2 + along**2) - radius
 
-logging.info(f"Starting coverage: {current_coverage*100:.1f}%")
-logging.info(f"Target:            {BEAM_COVERAGE_TARGET*100:.1f}%")
+
+def _sdf_cone_gpu(points, center, axis, half_height, r_bottom, r_top, **kwargs):
+    ax    = torch.tensor(axis / (np.linalg.norm(axis) + 1e-10),
+                         dtype=torch.float32, device=DEVICE)
+    c     = torch.tensor(center, dtype=torch.float32, device=DEVICE)
+    a     = c - ax * half_height
+    b_    = ax * 2.0 * half_height
+    pa    = points - a
+    baba  = b_ @ b_
+    t     = torch.clamp((pa @ b_) / (baba + 1e-10), 0.0, 1.0)
+    r     = r_bottom + (r_top - r_bottom) * t
+    radial = torch.norm(pa - t.unsqueeze(1) * b_, dim=1)
+    return radial - r
+
+
+_SDF_GPU_DISPATCH = {
+    'sphere':       _sdf_sphere_gpu,
+    'capsule':      _sdf_capsule_gpu,
+    'cylinder':     _sdf_cylinder_gpu,
+    'box':          _sdf_box_gpu,
+    'torus':        _sdf_torus_gpu,
+    'capped_torus': _sdf_torus_gpu,
+    'cone':         _sdf_cone_gpu,
+}
+
+
+def eval_primitive_gpu(points, primitive):
+    """Evaluate SDF of a single primitive on GPU. Returns Tensor[N]."""
+    fn = _SDF_GPU_DISPATCH.get(primitive['type'])
+    if fn is None:
+        raise ValueError(f"Unknown primitive type: {primitive['type']}")
+    return fn(points, **primitive)
+
+
+def eval_union_gpu(points, primitives, k_smooth=32.0):
+    """Smooth union of all primitives on GPU. Returns Tensor[N]."""
+    if not primitives:
+        return torch.full((len(points),), float('inf'), device=DEVICE)
+    result = eval_primitive_gpu(points, primitives[0])
+    for prim in primitives[1:]:
+        d2 = eval_primitive_gpu(points, prim)
+        h  = torch.clamp(0.5 + 0.5 * (d2 - result) * k_smooth, 0.0, 1.0)
+        result = d2 * (1.0 - h) + result * h - h * (1.0 - h) / k_smooth
+    return result
+
+
+def coverage_mask_gpu(points, primitives, epsilon):
+    """Boolean mask of explained points on GPU."""
+    if not primitives:
+        return torch.zeros(len(points), dtype=torch.bool, device=DEVICE)
+    return torch.abs(eval_union_gpu(points, primitives)) <= epsilon
+
+
+# ---------------------------------------------------------------------------
+# 3c: Initialize coverage from step 2 primitives
+# ---------------------------------------------------------------------------
+
+logging.info("Computing initial GPU coverage from step 2 primitives...")
+
+current_primitives  = list(promoted_primitives)
+voxel_mask_gpu      = coverage_mask_gpu(voxels_gpu, current_primitives, BEAM_EPSILON)
+surface_mask_gpu    = coverage_mask_gpu(surface_pts_gpu, current_primitives, BEAM_EPSILON)
+current_coverage    = float(surface_mask_gpu.float().mean().item())
+
+logging.info(f"Starting voxel coverage:   "
+             f"{float(voxel_mask_gpu.float().mean().item())*100:.1f}%")
+logging.info(f"Starting surface coverage: {current_coverage*100:.1f}%")
+logging.info(f"Target:                    {BEAM_COVERAGE_TARGET*100:.1f}%")
+
+# ---------------------------------------------------------------------------
+# 3d: Greedy voxel beam search loop
+# ---------------------------------------------------------------------------
 
 n_added = 0
+MAX_BEAM_RADIUS = float(max(medial_radii))
 
 while current_coverage < BEAM_COVERAGE_TARGET and n_added < BEAM_MAX_PRIMITIVES:
 
-    # --- Find residual points ---
-    residual_pts   = surface_pts[~current_mask]
-    residual_idx   = np.where(~current_mask)[0]
-    n_residual     = len(residual_pts)
+    # --- Find candidate seed voxels ---
+    # Unexplained + deep enough from surface to avoid gap microprimitives
+    deep_enough   = surf_dist_gpu > MIN_DEPTH
+    unexplained   = ~voxel_mask_gpu
+    candidate_mask = unexplained & deep_enough
 
-    logging.info(f"  Iteration {n_added+1}: {n_residual} residual points "
-                 f"({(1-current_coverage)*100:.1f}% uncovered)")
+    n_candidates = int(candidate_mask.sum().item())
+    logging.info(f"  Iteration {n_added+1}: "
+                 f"{int(unexplained.sum().item())} unexplained voxels, "
+                 f"{n_candidates} deep candidates, "
+                 f"surface coverage {current_coverage*100:.1f}%")
 
-    if n_residual < DBSCAN_MIN_SAMPLES:
-        logging.info("  Too few residual points, stopping.")
+    if n_candidates < 5:
+        logging.info("  Too few candidate voxels, stopping.")
         break
 
-    # --- Cluster residual points ---
-    db      = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES).fit(residual_pts)
-    labels  = db.labels_
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    # Pull candidate voxels and their surface distances to CPU for seed finding
+    cand_pts_gpu  = voxels_gpu[candidate_mask]
+    cand_dist_gpu = surf_dist_gpu[candidate_mask]
 
-    if n_clusters == 0:
-        logging.info("  No clusters found (all noise), stopping.")
+    cand_pts  = cand_pts_gpu.cpu().numpy()
+    cand_dist = cand_dist_gpu.cpu().numpy()
+
+    # --- Find local maxima of surface distance among candidate voxels ---
+    # Same logic as step 1: a voxel is a seed if its distance > all k neighbors
+    LOCAL_SEED_K = min(20, len(cand_pts) - 1)
+    if LOCAL_SEED_K < 1:
+        logging.info("  Not enough candidates for neighbor search, stopping.")
         break
 
-    logging.info(f"  Found {n_clusters} clusters "
-                 f"(noise: {(labels==-1).sum()} points)")
+    seed_kd   = scipy.spatial.cKDTree(cand_pts)
+    _, nbr_idx = seed_kd.query(cand_pts, k=LOCAL_SEED_K + 1, workers=-1)
+    nbr_dist  = cand_dist[nbr_idx[:, 1:]]
+    is_seed   = np.all(cand_dist[:, None] > nbr_dist, axis=1)
 
-    # --- Propose and score candidates from each cluster ---
+    seed_pts  = cand_pts[is_seed]
+    seed_dist = cand_dist[is_seed]
+
+    logging.info(f"  Seeds found: {len(seed_pts)}")
+
+    if len(seed_pts) == 0:
+        logging.info("  No seeds found, stopping.")
+        break
+
+    # --- For each seed, propose a sphere candidate ---
+    # Sphere first: center=seed, radius=surface_distance (like step 1).
+    # We score all seeds on GPU in one batched pass, pick the best.
+    seed_pts_gpu  = torch.tensor(seed_pts,  dtype=torch.float32, device=DEVICE)
+    seed_dist_gpu = torch.tensor(seed_dist, dtype=torch.float32, device=DEVICE)
+
+    # Clamp radius to MAX_BEAM_RADIUS
+    seed_radii_gpu = torch.clamp(seed_dist_gpu * 0.9, max=MAX_BEAM_RADIUS)
+
+    # Batched sphere SDF on surface points: (N_seeds, N_surface)
+    # For each seed, compute how many new surface points it would explain
+    # surface_pts_gpu: (N_surf, 3), seed_pts_gpu: (N_seeds, 3)
+    # dist[i,j] = ||surface_pts[j] - seed[i]||
+    # Do in chunks if needed to avoid OOM
+    CHUNK = 512
     best_gain      = 0.0
     best_candidate = None
 
-    for cluster_id in range(n_clusters):
-        cluster_mask = labels == cluster_id
-        cluster_pts  = residual_pts[cluster_mask]
+    current_surf_mask_gpu = coverage_mask_gpu(
+        surface_pts_gpu, current_primitives, BEAM_EPSILON
+    )
 
-        candidates = _propose_candidates(cluster_pts)
+    for chunk_start in range(0, len(seed_pts_gpu), CHUNK):
+        chunk_end    = min(chunk_start + CHUNK, len(seed_pts_gpu))
+        seeds_chunk  = seed_pts_gpu[chunk_start:chunk_end]    # (C, 3)
+        radii_chunk  = seed_radii_gpu[chunk_start:chunk_end]  # (C,)
 
-        for cand in candidates:
-            gain, _ = _coverage_gain(cand, current_mask, surface_pts, BEAM_EPSILON)
-            if gain > best_gain:
-                if _center_is_inside(cand['center'], mesh):
-                    best_gain      = gain
-                    best_candidate = cand
+        # (C, N_surf) distance matrix
+        diff  = surface_pts_gpu.unsqueeze(0) - seeds_chunk.unsqueeze(1)  # (C, N, 3)
+        dists = torch.norm(diff, dim=2)                                   # (C, N)
+        sdf   = dists - radii_chunk.unsqueeze(1)                          # (C, N)
+
+        # Explained mask per candidate: |sdf| <= epsilon
+        explains = torch.abs(sdf) <= BEAM_EPSILON                         # (C, N) bool
+
+        # New points explained (not already covered)
+        new_explains = explains & ~current_surf_mask_gpu.unsqueeze(0)     # (C, N)
+        gains        = new_explains.float().sum(dim=1) / len(surface_pts) # (C,)
+
+        best_in_chunk = int(torch.argmax(gains).item())
+        best_gain_chunk = float(gains[best_in_chunk].item())
+
+        if best_gain_chunk > best_gain:
+            best_gain = best_gain_chunk
+            global_idx = chunk_start + best_in_chunk
+            best_candidate = {
+                'type':        'sphere',
+                'center':      seed_pts[global_idx],
+                'radius':      float(seed_radii_gpu[global_idx].item()),
+                'axis':        None,
+                'half_height': None,
+                'axes':        None,
+            }
 
     if best_candidate is None or best_gain < BEAM_MIN_GAIN:
         logging.info(f"  Best gain {best_gain*100:.2f}% below threshold, stopping.")
@@ -1448,12 +1546,15 @@ while current_coverage < BEAM_COVERAGE_TARGET and n_added < BEAM_MAX_PRIMITIVES:
 
     # --- Commit best candidate ---
     current_primitives.append(best_candidate)
-    new_prim_sdf  = eval_primitive(surface_pts, best_candidate)
-    new_prim_mask = np.abs(new_prim_sdf) <= BEAM_EPSILON
-    current_mask  = current_mask | new_prim_mask
-    current_coverage = float(current_mask.mean())
 
-    logging.info(f"  Committed {best_candidate['type']} "
+    # Update masks on GPU
+    new_sdf_vox  = eval_primitive_gpu(voxels_gpu,      best_candidate)
+    new_sdf_surf = eval_primitive_gpu(surface_pts_gpu, best_candidate)
+    voxel_mask_gpu   = voxel_mask_gpu   | (torch.abs(new_sdf_vox)  <= BEAM_EPSILON)
+    surface_mask_gpu = surface_mask_gpu | (torch.abs(new_sdf_surf) <= BEAM_EPSILON)
+    current_coverage = float(surface_mask_gpu.float().mean().item())
+
+    logging.info(f"  Committed sphere r={best_candidate['radius']:.3f} "
                  f"(gain={best_gain*100:.1f}%, "
                  f"coverage now {current_coverage*100:.1f}%)")
     n_added += 1
@@ -1466,35 +1567,24 @@ logging.info(f"Total primitives: {len(current_primitives)}")
 # Step 3 visualization
 # ---------------------------------------------------------------------------
 
-def _visualize_beam_search(fig_primitives, residual_pts, cluster_labels, 
-                            mesh, step_num, primitives):
-    """
-    Visualize current state of beam search:
-    - Mesh (transparent)
-    - Current primitives (colored by type)
-    - Residual points colored by cluster
-    """
-    import plotly.graph_objects as go
-    
+def _visualize_beam_search(residual_pts, cluster_labels, mesh, step_num, primitives):
     fig = go.Figure()
-    
-    # --- Mesh ---
+
+    # Mesh
     fig.add_trace(go.Mesh3d(
         x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
         i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
         color='pink', opacity=0.15, name='mesh', showlegend=True,
     ))
-    
-    # --- Residual points colored by cluster ---
-    unique_labels = sorted(set(cluster_labels))
+
+    # Residual points colored by cluster
     cluster_colors = [
         '#e6194b','#3cb44b','#ffe119','#4363d8','#f58231',
         '#911eb4','#42d4f4','#f032e6','#bfef45','#fabed4',
         '#469990','#dcbeff','#9A6324','#fffac8','#800000',
         '#aaffc3','#808000','#ffd8b1','#000075','#a9a9a9',
     ]
-    
-    for label in unique_labels:
+    for label in sorted(set(cluster_labels)):
         mask  = cluster_labels == label
         pts   = residual_pts[mask]
         color = '#888888' if label == -1 else cluster_colors[label % len(cluster_colors)]
@@ -1502,50 +1592,55 @@ def _visualize_beam_search(fig_primitives, residual_pts, cluster_labels,
         fig.add_trace(go.Scatter3d(
             x=pts[:,0], y=pts[:,1], z=pts[:,2],
             mode='markers',
-            marker=dict(size=2, color=color, opacity=0.7),
+            marker=dict(size=2, color=color, opacity=0.6),
             name=name, showlegend=True,
         ))
-    
-    # --- Current primitives ---
+
+    # Primitives
     type_colors = {
         'sphere': 'blue', 'capsule': 'green', 'cylinder': 'cyan',
         'cone': 'purple', 'box': 'orange', 'torus': 'magenta',
+        'capped_torus': 'pink',
     }
-    
+    type_seen = set()
     for pi, p in enumerate(primitives):
         ptype = p['type']
         color = type_colors.get(ptype, 'gray')
         name  = f"{ptype}_{pi}"
-        show  = pi == 0
-        
+        show  = ptype not in type_seen
+        type_seen.add(ptype)
         if ptype == 'sphere':
             _add_sphere(fig, p['center'], p['radius'], color, name, show)
         elif ptype in ('capsule', 'cylinder', 'cone'):
             _add_capsule(fig, p['center'], p['radius'],
-                        p['axis'], p['half_height'], color, name, show)
+                         p['axis'], p['half_height'], color, name, show)
         elif ptype == 'box':
             _add_box(fig, p['center'], p['radius'], p['axis'],
-                    p['half_height'], p['axes'], color, name, show,
-                    half_extents=p.get('half_extents'))
+                     p['half_height'], p['axes'], color, name, show,
+                     half_extents=p.get('half_extents'))
         elif ptype in ('torus', 'capped_torus'):
             _add_torus(fig, p['center'], p['major_radius'], p['radius'],
-                      p['axis'], color, name, show)
-    
+                       p['axis'], color, name, show)
+
     n_types = {}
     for p in primitives:
         n_types[p['type']] = n_types.get(p['type'], 0) + 1
     title = (f"Step 3 iteration {step_num}: "
-             + ", ".join(f"{v} {k}s" for k,v in n_types.items())
-             + f" | coverage {float(current_mask.mean())*100:.1f}%")
-    
-    fig.update_layout(title=title, showlegend=True)
-    fname = f"beam_search_step{step_num:03d}.html"
-    fig.write_html(fname)
-    logging.info(f"  Saved: {fname}")
+             + ", ".join(f"{v} {k}s" for k, v in n_types.items())
+             + f" | coverage {current_coverage*100:.1f}%")
 
-# Final beam search visualization
-db_final   = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES).fit(
-    surface_pts[~current_mask]
-)
-_visualize_beam_search(None, surface_pts[~current_mask], db_final.labels_,
+    fig.update_layout(title=title, scene=dict(aspectmode='data'),
+                      width=1100, height=850)
+    fname = 'beam_search_final.html'
+    fig.write_html(fname)
+    logging.info(f"Saved: {fname}")
+
+
+# Residual surface points for visualization
+residual_surf     = surface_pts[~surface_mask_gpu.cpu().numpy()]
+# Simple distance-based labeling for visualization — no DBSCAN needed
+# Just show the raw residual points, all same label
+residual_labels   = np.zeros(len(residual_surf), dtype=int)
+
+_visualize_beam_search(residual_surf, residual_labels,
                        mesh, n_added, current_primitives)
