@@ -70,7 +70,7 @@ def _lasso_fit(Phi, y, initial_alphas=None):
         lasso.fit(Phi, y)
         alphas = lasso.coef_
 
-    logging.debug(f"Lasso: lambda={best_lambda:.6f}, "
+    logging.info(f"Lasso: lambda={best_lambda:.6f}, "
                   f"nonzero={np.sum(alphas != 0)}/{len(alphas)}")
 
     return alphas

@@ -50,7 +50,8 @@ class PySRBackend(SRBackend):
                  populations=15,
                  random_state=None,
                  batching=True,
-                 batch_size=1000):
+                 batch_size=1000,
+                 loss_function=None):
         self.niterations      = niterations
         self.binary_operators = binary_operators or ["+", "-", "*", "/"]
         self.unary_operators  = unary_operators  or ["sin", "cos",
@@ -59,6 +60,7 @@ class PySRBackend(SRBackend):
         self.random_state     = random_state
         self.batching         = batching
         self.batch_size       = batch_size
+        self.loss_function    = loss_function
 
     def fit(self, X, y, initial_alphas=None):
         """
@@ -99,6 +101,7 @@ class PySRBackend(SRBackend):
                 tempdir          = tempdir,
                 batching         = self.batching,
                 batch_size       = self.batch_size,
+                loss_function    = self.loss_function,
                 maxsize          = 60,
                 delete_tempfiles = True,
                 verbosity        = 1,

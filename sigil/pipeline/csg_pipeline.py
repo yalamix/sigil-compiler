@@ -41,7 +41,7 @@ created = [
     'torus'
 ]
 
-mesh_option = "bunny-high"
+mesh_option = "fandisk"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -105,6 +105,325 @@ mesh.apply_translation(-mesh.bounds.mean(axis=0))
 scale = mesh.bounds[1].max() - mesh.bounds[0].min()
 mesh.apply_scale(1.0 / scale)
 logging.info(f"Normalized bounds: {mesh.bounds}")
+
+# ===========================================================================
+# Step 0: Slab pre-pass — detect coplanar face regions, place exact-fit
+#         extruded polygon primitives, mark their surface points as explained.
+#
+# This runs BEFORE the medial axis so that:
+#   (a) step 1 interior sampling ignores already-explained regions
+#   (b) step 2 skeleton analysis never places redundant boxes on flat faces
+#
+# Algorithm:
+#   1. Build face adjacency graph; region-grow by face normal similarity
+#   2. Filter regions below area threshold (relative to total mesh area)
+#   3. For each qualifying region:
+#      a. Project face vertices onto the region's mean plane
+#      b. Compute 2D convex hull -> polygon vertices
+#      c. Raycast inward from polygon boundary points to find thickness
+#      d. Emit extruded_polygon primitive with exact surface fit
+# ===========================================================================
+
+logging.info("=" * 60)
+logging.info("Step 0: Slab pre-pass")
+
+# --- Configuration ---
+SLAB_NORMAL_DOT_THRESHOLD = 0.998   # cos(angle) threshold for coplanar faces
+                                     # 0.998 ≈ 3.6° tolerance
+SLAB_MIN_AREA_FRACTION    = 0.01    # region must be >= 1% of total mesh area
+                                     # to qualify for a slab primitive
+SLAB_THICKNESS_N_RAYS     = 16      # number of boundary points to raycast for
+                                     # thickness estimation
+SLAB_EPSILON              = 1e-4    # small offset to avoid self-intersection
+                                     # when raycasting inward
+
+total_mesh_area = float(mesh.area)
+logging.info(f"Total mesh area: {total_mesh_area:.4f}")
+logging.info(f"Slab area threshold: {SLAB_MIN_AREA_FRACTION * total_mesh_area:.4f} "
+             f"({SLAB_MIN_AREA_FRACTION*100:.1f}% of total)")
+
+# ---------------------------------------------------------------------------
+# 0a: Build face normal adjacency and region-grow coplanar groups
+# ---------------------------------------------------------------------------
+
+face_normals  = mesh.face_normals          # (F, 3) unit normals
+face_areas    = mesh.area_faces            # (F,) per-face area
+face_adj      = mesh.face_adjacency        # (E, 2) pairs of adjacent face indices
+n_faces       = len(face_normals)
+
+# For each face, find its adjacent faces and their normal dot product
+logging.info(f"Region-growing {n_faces} faces by normal similarity...")
+
+# Build adjacency list
+adj_list = [[] for _ in range(n_faces)]
+for fi, fj in face_adj:
+    adj_list[fi].append(fj)
+    adj_list[fj].append(fi)
+
+# BFS region growing — seed from each unvisited face
+visited     = np.zeros(n_faces, dtype=bool)
+slab_regions = []   # list of np.array of face indices
+
+for seed_face in range(n_faces):
+    if visited[seed_face]:
+        continue
+    
+    region      = []
+    queue       = [seed_face]
+    seed_normal = face_normals[seed_face]
+    visited[seed_face] = True
+    
+    while queue:
+        fi = queue.pop()
+        region.append(fi)
+        for fj in adj_list[fi]:
+            if visited[fj]:
+                continue
+            # Accept neighbor if normal is nearly parallel to seed normal
+            dot = abs(float(np.dot(face_normals[fj], seed_normal)))
+            if dot >= SLAB_NORMAL_DOT_THRESHOLD:
+                visited[fj] = True
+                queue.append(fj)
+    
+    slab_regions.append(np.array(region))
+
+logging.info(f"Found {len(slab_regions)} coplanar regions")
+
+# ---------------------------------------------------------------------------
+# 0b: Filter regions by area and build extruded polygon primitives
+# ---------------------------------------------------------------------------
+
+slab_primitives     = []
+slab_face_mask      = np.zeros(n_faces, dtype=bool)   # faces claimed by slabs
+
+min_area = SLAB_MIN_AREA_FRACTION * total_mesh_area
+
+qualifying = [(r, face_areas[r].sum()) for r in slab_regions
+              if face_areas[r].sum() >= min_area]
+qualifying.sort(key=lambda x: -x[1])   # largest first
+
+logging.info(f"Qualifying regions (>= {min_area:.4f} area): {len(qualifying)}")
+
+for region_faces, region_area in qualifying:
+    
+    # Mean normal for this region (weighted by face area for stability)
+    weights      = face_areas[region_faces]
+    mean_normal  = (face_normals[region_faces] * weights[:, None]).sum(axis=0)
+    mean_normal /= np.linalg.norm(mean_normal) + 1e-10
+
+    # Collect all unique vertices in this region
+    region_verts_idx = np.unique(mesh.faces[region_faces].ravel())
+    region_verts     = mesh.vertices[region_verts_idx]
+    region_centroid  = region_verts.mean(axis=0)
+
+    # Build an orthonormal basis for the plane: (u, v, normal)
+    # Find a vector not parallel to normal
+    helper = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(helper, mean_normal)) > 0.9:
+        helper = np.array([0.0, 1.0, 0.0])
+    u_axis = np.cross(mean_normal, helper)
+    u_axis /= np.linalg.norm(u_axis) + 1e-10
+    v_axis  = np.cross(mean_normal, u_axis)
+    v_axis /= np.linalg.norm(v_axis) + 1e-10
+
+    # Project vertices onto the plane (2D coordinates)
+    delta    = region_verts - region_centroid
+    coords2d = np.stack([delta @ u_axis, delta @ v_axis], axis=1)  # (N, 2)
+
+    # Concave hull via alpha shapes
+    # Alpha controls tightness: smaller = more concave detail
+    # We use the mean edge length of the region as a natural scale
+    region_edge_lengths = np.linalg.norm(
+        mesh.vertices[mesh.faces[region_faces][:, 1]] -
+        mesh.vertices[mesh.faces[region_faces][:, 0]], axis=1
+    )
+    mean_edge = float(region_edge_lengths.mean())
+    alpha = 1.0 / (mean_edge * 2.0)   # tighter than convex hull
+
+    try:
+        import alphashape
+        shape2d = alphashape.alphashape(coords2d, alpha)
+        if shape2d.is_empty or shape2d.geom_type not in ('Polygon', 'MultiPolygon'):
+            raise ValueError("degenerate alpha shape")
+        if shape2d.geom_type == 'MultiPolygon':
+            # Take largest polygon
+            shape2d = max(shape2d.geoms, key=lambda g: g.area)
+        hull_pts2d = np.array(shape2d.exterior.coords[:-1])  # drop closing repeat
+    except Exception as e:
+        logging.warning(f"  Alpha shape failed ({e}), skipping.")
+        continue
+    # -----------------------------------------------------------------------
+    # 0c: Raycast inward from centroid to find slab thickness
+    # -----------------------------------------------------------------------
+    # One ray from centroid along -normal, one along +normal.
+    # The two hit distances sum to total thickness; we want the smaller
+    # (distance to the opposite face), which is the slab thickness.
+
+    SELF_HIT_MIN_DIST = 0.005   # ignore hits closer than this (self-intersection)
+    NORMAL_OFFSET     = 0.01    # offset from surface before shooting
+
+    thickness = None
+    for origin_sign, direction in [(+1, -mean_normal), (-1, mean_normal)]:
+        origin = region_centroid + origin_sign * NORMAL_OFFSET * mean_normal
+        try:
+            locs, _, _ = mesh.ray.intersects_location(
+                ray_origins    = [origin],
+                ray_directions = [direction],
+                multiple_hits  = True,
+            )
+            if len(locs) == 0:
+                continue
+            dists = np.linalg.norm(locs - origin, axis=1)
+            dists = dists[dists > SELF_HIT_MIN_DIST]
+            if len(dists) == 0:
+                continue
+            dist = float(dists.min()) + NORMAL_OFFSET  # add back the offset
+            if thickness is None or dist < thickness:
+                thickness = dist
+        except Exception:
+            pass
+
+    if thickness is None or thickness < 1e-4:
+        logging.warning(f"  Thickness raycast failed or too small, skipping")
+        continue
+
+    # -----------------------------------------------------------------------
+    # 0d: Emit extruded_polygon primitive
+    # -----------------------------------------------------------------------
+    slab_prim = {
+        'type':        'extruded_polygon',
+        'center':      region_centroid - mean_normal * (thickness / 2.0),
+        'normal':      mean_normal,          # extrusion axis
+        'u_axis':      u_axis,
+        'v_axis':      v_axis,
+        'hull_pts2d':  hull_pts2d,           # 2D polygon in (u,v) space
+        'thickness':   thickness,
+        # Fields required by generic dispatch (set to None or defaults)
+        'radius':      thickness / 2.0,
+        'axis':        mean_normal,
+        'half_height': thickness / 2.0,
+        'axes':        None,
+    }
+    slab_primitives.append(slab_prim)
+    slab_face_mask[region_faces] = True
+
+    area_pct = 100.0 * region_area / total_mesh_area
+    logging.info(f"  Slab: area={region_area:.4f} ({area_pct:.1f}%), "
+                 f"thickness={thickness:.4f}, "
+                 f"hull_verts={len(hull_pts2d)}, "
+                 f"normal={mean_normal.round(2)}")
+
+logging.info(f"Step 0 complete: {len(slab_primitives)} slab primitives, "
+             f"covering {slab_face_mask.sum()} / {n_faces} faces "
+             f"({100*slab_face_mask.mean():.1f}%)")
+
+# ---------------------------------------------------------------------------
+# 0e: SDF for extruded_polygon
+# ---------------------------------------------------------------------------
+# Inigo Quilez pattern: signed distance = max(2D_polygon_sdf, |along_normal| - half_thickness)
+# The 2D polygon SDF is the min signed distance to all edges (negative inside).
+
+def _sdf_polygon_2d(p2d, hull_pts2d):
+    """2D SDF for arbitrary (possibly concave) polygon. Negative inside."""
+    from shapely.geometry import Point, Polygon
+    poly = Polygon(hull_pts2d)
+    # Vectorized via distance to boundary - inside test
+    result = np.array([
+        poly.boundary.distance(Point(p)) * (-1 if poly.contains(Point(p)) else 1)
+        for p in p2d
+    ])
+    return result
+
+
+def _sdf_extruded_polygon(points, center, normal, u_axis, v_axis,
+                           hull_pts2d, thickness, **kwargs):
+    """
+    Exact SDF for a flat extruded convex polygon.
+    points: (N, 3)
+    Returns: (N,) signed distance
+    """
+    delta   = points - center                        # (N, 3)
+    along   = delta @ normal                         # (N,) projection along normal
+    pu      = delta @ u_axis                         # (N,) u coordinate in plane
+    pv      = delta @ v_axis                         # (N,) v coordinate in plane
+    p2d     = np.stack([pu, pv], axis=1)             # (N, 2)
+
+    # 2D polygon SDF (convex hull, CCW winding assumed)
+    n_verts = len(hull_pts2d)
+    # For each edge, compute signed distance from p2d
+    # Signed distance to concave polygon
+    poly_sdf = _sdf_polygon_2d(p2d, hull_pts2d)
+
+    # Height SDF: |along| - half_thickness
+    half_t   = thickness / 2.0
+    height_sdf = np.abs(along) - half_t
+
+    # Extruded SDF: IQ's formula for extruded shape
+    # d = (max(poly_sdf, 0), max(height_sdf, 0)) -> length - min(max(poly,height),0)
+    w = np.stack([
+        np.maximum(poly_sdf,   0.0),
+        np.maximum(height_sdf, 0.0),
+    ], axis=1)
+    sdf_outside = np.linalg.norm(w, axis=1)
+    sdf_inside  = np.minimum(np.maximum(poly_sdf, height_sdf), 0.0)
+    return sdf_outside + sdf_inside
+
+
+# ---------------------------------------------------------------------------
+# 0f: Visualization
+# ---------------------------------------------------------------------------
+
+def _visualize_slabs(mesh, slab_primitives):
+    fig = go.Figure()
+    fig.add_trace(go.Mesh3d(
+        x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
+        i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
+        color='lightgray', opacity=0.25, name='mesh', showlegend=True,
+    ))
+    colors = ['blue','green','red','orange','purple','cyan','magenta']
+    for si, slab in enumerate(slab_primitives):
+        c      = slab['center']
+        n      = slab['normal']
+        u      = slab['u_axis']
+        v      = slab['v_axis']
+        pts2d  = slab['hull_pts2d']
+        thick  = slab['thickness']
+        color  = colors[si % len(colors)]
+
+        # Draw top and bottom polygon faces + side edges
+        for sign in [+1, -1]:
+            offset = c + sign * (thick / 2.0) * n
+            pts3d  = offset + pts2d[:,0:1]*u + pts2d[:,1:2]*v
+            # Close the polygon
+            xs = np.append(pts3d[:,0], pts3d[0,0])
+            ys = np.append(pts3d[:,1], pts3d[0,1])
+            zs = np.append(pts3d[:,2], pts3d[0,2])
+            fig.add_trace(go.Scatter3d(
+                x=xs, y=ys, z=zs, mode='lines',
+                line=dict(color=color, width=4),
+                name=f'slab_{si}', showlegend=(sign==1),
+            ))
+        # Side edges
+        n_h = len(pts2d)
+        for k in range(n_h):
+            pt2  = pts2d[k]
+            top  = c + (thick/2.0)*n + pt2[0]*u + pt2[1]*v
+            bot  = c - (thick/2.0)*n + pt2[0]*u + pt2[1]*v
+            fig.add_trace(go.Scatter3d(
+                x=[top[0],bot[0]], y=[top[1],bot[1]], z=[top[2],bot[2]],
+                mode='lines', line=dict(color=color, width=2),
+                showlegend=False,
+            ))
+
+    fig.update_layout(
+        title=f"Step 0: {len(slab_primitives)} slab primitives",
+        scene=dict(aspectmode='data'), width=1100, height=850,
+    )
+    fig.write_html('slab_prepass_step0.html')
+    logging.info("Saved: slab_prepass_step0.html")
+
+_visualize_slabs(mesh, slab_primitives)
+quit()
 
 # ---------------------------------------------------------------------------
 # Step 1b: Inside/outside test — signed distance with ray casting fallback
@@ -176,6 +495,20 @@ if len(interior_points) < 100:
 logging.info(f"Sampling {N_SURFACE_KD} surface points for KD-tree...")
 surface_pts, _ = trimesh.sample.sample_surface(mesh, N_SURFACE_KD, seed=42)
 
+# Mask surface points already explained by slabs (exact fit, no epsilon needed)
+# We use a small epsilon only to account for floating point in the SDF
+slab_explained_mask = np.zeros(len(surface_pts), dtype=bool)
+for slab in slab_primitives:
+    sdf = _sdf_extruded_polygon(surface_pts, **slab)
+    slab_explained_mask |= (np.abs(sdf) <= 0.005)
+
+logging.info(f"Slab pre-pass explains {slab_explained_mask.sum()} / "
+             f"{len(surface_pts)} surface points "
+             f"({100*slab_explained_mask.mean():.1f}%)")
+
+# Interior points near slab regions are also excluded from medial axis search
+# by removing them from the candidate pool before step 1e (local maxima finding)
+
 logging.info("Building KD-tree on surface points...")
 kd_tree = scipy.spatial.cKDTree(surface_pts)
 
@@ -193,6 +526,14 @@ logging.info(f"Distance range: {radii.min():.4f} — {radii.max():.4f}")
 # A point is a local maximum if its inscribed sphere radius is strictly
 # greater than all its k nearest neighbors' radii.
 # These are the medial axis points — centers of maximal inscribed spheres.
+
+# Exclude interior points whose nearest surface point is slab-explained
+# (those regions are already handled — no medial sphere needed there)
+nearest_surf_idx = kd_tree.query(interior_points, k=1, workers=-1)[1]
+not_in_slab      = ~slab_explained_mask[nearest_surf_idx]
+interior_points  = interior_points[not_in_slab]
+radii            = radii[not_in_slab]
+logging.info(f"After slab exclusion: {len(interior_points)} interior points remain")
 
 logging.info(f"Finding local maxima (k={LOCAL_MAX_K} neighbors)...")
 
@@ -1437,6 +1778,45 @@ logging.info(f"Target:                    {BEAM_COVERAGE_TARGET*100:.1f}%")
 # 3d: Greedy voxel beam search loop
 # ---------------------------------------------------------------------------
 
+def _propose_capsule(center, radius, cand_pts, cand_dist, seed_kd, neighborhood_k=30):
+    """
+    Given a seed center, find neighboring unexplained voxels and fit a capsule.
+    Returns capsule primitive dict or None if neighborhood is too small.
+    """
+    # radius here is the seed's surface distance — the safe inscribed sphere radius
+    nbr_idx = seed_kd.query_ball_point(center, r=radius * 1.5)
+    if len(nbr_idx) < 4:
+        return None
+
+    nbr_pts = cand_pts[nbr_idx]
+
+    # PCA axis only — center stays at seed
+    centered = nbr_pts - center
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    axis = Vt[0]
+
+    # Project neighbors onto axis relative to seed center
+    projections = centered @ axis
+    proj_min = projections.min()
+    proj_max = projections.max()
+
+    # Half-height capped at seed surface distance — same guarantee as sphere radius
+    half_height = float(np.clip((proj_max - proj_min) / 2.0, 0.0, radius * 0.9))
+    cap_radius  = float(np.clip(radius * 0.85, 0.01, MAX_BEAM_RADIUS))
+
+    if half_height < cap_radius * 1.1:
+        return None  # not elongated enough to beat a sphere
+
+    return {
+        'type':        'capsule',
+        'center':      center,       # ALWAYS the seed point
+        'radius':      cap_radius,
+        'axis':        axis,
+        'half_height': half_height,
+        'axes':        None,
+    }
+
+
 n_added = 0
 MAX_BEAM_RADIUS = float(max(medial_radii))
 
@@ -1500,33 +1880,31 @@ while current_coverage < BEAM_COVERAGE_TARGET and n_added < BEAM_MAX_PRIMITIVES:
     # surface_pts_gpu: (N_surf, 3), seed_pts_gpu: (N_seeds, 3)
     # dist[i,j] = ||surface_pts[j] - seed[i]||
     # Do in chunks if needed to avoid OOM
-    CHUNK = 512
+    CHUNK = 256  # slightly smaller to leave room for capsule scoring
+
     best_gain      = 0.0
     best_candidate = None
 
     current_surf_mask_gpu = coverage_mask_gpu(
         surface_pts_gpu, current_primitives, BEAM_EPSILON
     )
+    unexplained_surf_gpu = ~current_surf_mask_gpu  # (N_surf,) bool
 
+    # --- Score sphere candidates in batched GPU pass ---
     for chunk_start in range(0, len(seed_pts_gpu), CHUNK):
-        chunk_end    = min(chunk_start + CHUNK, len(seed_pts_gpu))
-        seeds_chunk  = seed_pts_gpu[chunk_start:chunk_end]    # (C, 3)
-        radii_chunk  = seed_radii_gpu[chunk_start:chunk_end]  # (C,)
+        chunk_end   = min(chunk_start + CHUNK, len(seed_pts_gpu))
+        seeds_chunk = seed_pts_gpu[chunk_start:chunk_end]
+        radii_chunk = seed_radii_gpu[chunk_start:chunk_end]
 
-        # (C, N_surf) distance matrix
-        diff  = surface_pts_gpu.unsqueeze(0) - seeds_chunk.unsqueeze(1)  # (C, N, 3)
-        dists = torch.norm(diff, dim=2)                                   # (C, N)
-        sdf   = dists - radii_chunk.unsqueeze(1)                          # (C, N)
+        diff    = surface_pts_gpu.unsqueeze(0) - seeds_chunk.unsqueeze(1)
+        dists   = torch.norm(diff, dim=2)
+        sdf     = dists - radii_chunk.unsqueeze(1)
+        explains = torch.abs(sdf) <= BEAM_EPSILON
+        new_exp  = explains & unexplained_surf_gpu.unsqueeze(0)
+        gains    = new_exp.float().sum(dim=1) / len(surface_pts)
 
-        # Explained mask per candidate: |sdf| <= epsilon
-        explains = torch.abs(sdf) <= BEAM_EPSILON                         # (C, N) bool
-
-        # New points explained (not already covered)
-        new_explains = explains & ~current_surf_mask_gpu.unsqueeze(0)     # (C, N)
-        gains        = new_explains.float().sum(dim=1) / len(surface_pts) # (C,)
-
-        best_in_chunk = int(torch.argmax(gains).item())
-        best_gain_chunk = float(gains[best_in_chunk].item())
+        best_in_chunk     = int(torch.argmax(gains).item())
+        best_gain_chunk   = float(gains[best_in_chunk].item())
 
         if best_gain_chunk > best_gain:
             best_gain = best_gain_chunk
@@ -1540,9 +1918,32 @@ while current_coverage < BEAM_COVERAGE_TARGET and n_added < BEAM_MAX_PRIMITIVES:
                 'axes':        None,
             }
 
+    # --- Score capsule candidates (CPU fit, GPU score) ---
+    for i, (center, radius) in enumerate(zip(seed_pts, seed_dist)):
+        cap = _propose_capsule(center, radius, cand_pts, cand_dist, seed_kd)
+        if cap is None:
+            continue
+        
+        cap_sdf  = eval_primitive_gpu(surface_pts_gpu, cap)
+        explains = torch.abs(cap_sdf) <= BEAM_EPSILON
+        new_exp  = explains & unexplained_surf_gpu
+        gain     = float(new_exp.float().sum().item()) / len(surface_pts)
+        
+        if gain > best_gain:
+            best_gain      = gain
+            best_candidate = cap
+
     if best_candidate is None or best_gain < BEAM_MIN_GAIN:
         logging.info(f"  Best gain {best_gain*100:.2f}% below threshold, stopping.")
         break
+
+    # Dedup: skip if best candidate is nearly identical to last committed
+    if len(current_primitives) > 0 and best_candidate is not None:
+        last = current_primitives[-1]
+        if (last['type'] == best_candidate['type'] == 'capsule' and
+            np.linalg.norm(np.array(last['center']) - np.array(best_candidate['center'])) < BEAM_EPSILON * 2):
+            logging.info("  Dedup: identical capsule, stopping.")
+            break
 
     # --- Commit best candidate ---
     current_primitives.append(best_candidate)
@@ -1554,7 +1955,7 @@ while current_coverage < BEAM_COVERAGE_TARGET and n_added < BEAM_MAX_PRIMITIVES:
     surface_mask_gpu = surface_mask_gpu | (torch.abs(new_sdf_surf) <= BEAM_EPSILON)
     current_coverage = float(surface_mask_gpu.float().mean().item())
 
-    logging.info(f"  Committed sphere r={best_candidate['radius']:.3f} "
+    logging.info(f"  Committed {best_candidate['type']} r={best_candidate['radius']:.3f} "
                  f"(gain={best_gain*100:.1f}%, "
                  f"coverage now {current_coverage*100:.1f}%)")
     n_added += 1

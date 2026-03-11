@@ -3,6 +3,9 @@ import trimesh
 import logging
 
 from sigil.pipeline.balloon_pipeline import *
+from sigil.pipeline.balloon_hybrid import compile_mesh_hybrid
+from sigil.pipeline.balloon_nn import compile_mesh_nn
+from sigil.pipeline.balloon_sklearn import compile_mesh_sklearn
 
 def test_balloon_sphere():
     mesh   = trimesh.creation.icosphere(subdivisions=4)
@@ -28,15 +31,18 @@ def test_balloon_bunny():
     logging.info(f"Bunny original scale: {original_scale:.6f}")
     config = BalloonConfig(
         n_surface        = 20000,
+        start_degree     = 16,
         epsilon          = 0.05,    # 10x larger -- strong signal
         max_degree       = 20,
-        gd_steps         = 3000,
+        gd_steps         = 2000,
         gd_lr            = 0.001,
         rmse_threshold   = 1e-2,    # relative to epsilon now
         plateau_patience = 3,
         visualize_progress = True,
     )
-    equation = compile_mesh_pysr(mesh, config)
+
+    equation = compile_mesh_balloon(mesh, config)
+    # equation = compile_mesh_pysr(mesh, config)
 
     import sympy
     # Save equation to file
@@ -47,17 +53,41 @@ def test_balloon_bunny():
         out.write(str(sympy.diff(equation.sympy_expr, x1)) + '\n')
         out.write(str(sympy.diff(equation.sympy_expr, x2)) + '\n')    
 
+    return True, equation
+
+def test_balloon_bunny_hybrid():
+    mesh = trimesh.load(r'C:\Users\yalam\Documents\sigil-compiler\assets\meshes\bunny-high.obj')
+    original_scale = mesh.scale
+    mesh.apply_translation(-mesh.centroid)
+    mesh.apply_scale(1.0 / original_scale)
+    logging.info(f"Bunny original scale: {original_scale:.6f}")
+
+    equation = compile_mesh_nn(mesh)
+
+    import sympy
+    # Save equation to file
+    x0, x1, x2 = sympy.symbols('x0 x1 x2')
+    with open(r'C:\Users\yalam\Documents\sigil-compiler\outputs\bunny_equation_hybrid.txt', 'w') as out:
+        out.write(str(equation.sympy_expr) + '\n')
+        out.write(str(sympy.diff(equation.sympy_expr, x0)) + '\n')
+        out.write(str(sympy.diff(equation.sympy_expr, x1)) + '\n')
+        out.write(str(sympy.diff(equation.sympy_expr, x2)) + '\n')    
 
     return True, equation
 
 def test_balloon_torus():
     # Create torus mesh -- trimesh can generate this directly
-    mesh = trimesh.creation.torus(major_radius=1.0, minor_radius=0.3)
+    mesh = trimesh.creation.torus(
+        major_radius=1.0, 
+        minor_radius=0.3,
+        major_sections=128,  # default is 32
+        minor_sections=64,   # default is 16
+    )
     mesh.apply_translation(-mesh.centroid)
     mesh.apply_scale(1.0 / mesh.scale)
 
     config = BalloonConfig(
-        n_surface        = 10000,
+        n_surface        = 40000,
         epsilon          = 0.05,
         max_degree       = 8,      # torus is degree 4, so 8 is generous
         gd_steps         = 2000,
@@ -94,9 +124,10 @@ def test_balloon_cube():
 
 TESTS = [
     # ("sphere", test_balloon_sphere),    
-    ("torus", test_balloon_torus),
+    # ("torus", test_balloon_torus),
     # ("cube", test_balloon_cube),
     # ("bunny", test_balloon_bunny),
+    ("bunny_hybrid", test_balloon_bunny_hybrid)
 ]
 
 def run_all():

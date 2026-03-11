@@ -231,7 +231,7 @@ def _extract_float_constants(expr):
     return [f for f in all_floats if is_worth_optimizing(f)]
 
 
-def refine_coefficients(eq, X, y, steps=1000, lr=1e-3):
+def refine_coefficients(eq, X, y, steps=1000, lr=1e-3, n_surface=None):
     """
     Freeze expression structure, optimize all numerical constants
     via gradient descent (Adam).
@@ -321,17 +321,18 @@ def refine_coefficients(eq, X, y, steps=1000, lr=1e-3):
 
     for step in pbar:
         optimizer.zero_grad()
-
-        y_pred = f_torch(
-            X_t[:, 0], X_t[:, 1], X_t[:, 2],
-            *params
-        )                                           # (N,)
-
-        # Handle scalar output (constant expression after simplification)
+        y_pred = f_torch(X_t[:, 0], X_t[:, 1], X_t[:, 2], *params)
         if y_pred.ndim == 0:
             y_pred = y_pred.expand(len(y_t))
 
-        loss = torch.mean((y_pred - y_t) ** 2)     # scalar MSE
+        if n_surface is not None:
+            surf = y_pred[:n_surface]
+            rest = y_pred[n_surface:]
+            sign_y = torch.sign(y_t[n_surface:])
+            loss = surf.pow(2).mean() + torch.relu(-rest * sign_y).pow(2).mean()
+        else:
+            loss = torch.mean((y_pred - y_t) ** 2)
+
         loss.backward()
         optimizer.step()
 
